@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Optional
 
 from multi_hive.config import METRICS_FILE
 from multi_hive.core.platform import peak_rss_mb
@@ -24,7 +23,7 @@ from multi_hive.core.platform import peak_rss_mb
 
 class SprintMetrics:
     def __init__(self) -> None:
-        self._start_time: Optional[float] = None
+        self._start_time: float | None = None
         self.node_count = 0
         self.wall_time = 0.0
         self.peak_rss_mb = 0.0

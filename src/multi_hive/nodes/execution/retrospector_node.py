@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict
+from typing import Any
 
 from multi_hive.config import METRICS_FILE
 from multi_hive.core.loop_audit import write_loop_md
@@ -29,7 +29,7 @@ from multi_hive.core.memory import log_rejection
 from multi_hive.core.utils import flush_file, safe_path
 
 
-def retrospector_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def retrospector_node(state: dict[str, Any]) -> dict[str, Any]:
     project_files = state.get("project_files", {})
     loop_health = state.get("loop_health") or {}
     sprint_plan = state.get("sprint_plan", "")

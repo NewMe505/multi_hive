@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from multi_hive.config import LOOP_MD_FILE, METRICS_FILE
 
@@ -33,11 +33,11 @@ def _severity_icon(escalated: bool, had_error: bool) -> str:
 
 def write_loop_md(
     sprint_plan: str,
-    task_queue_log: List[Dict[str, Any]],
-    loop_health: Dict[str, Any],
+    task_queue_log: list[dict[str, Any]],
+    loop_health: dict[str, Any],
     wall_time_sec: float,
-    final_error: Optional[str],
-    semantic_verdicts: List[Dict[str, Any]],
+    final_error: str | None,
+    semantic_verdicts: list[dict[str, Any]],
 ) -> None:
     """
     Writes the LOOP.md audit trail for the current sprint.
@@ -58,7 +58,7 @@ def write_loop_md(
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     status = "ESCALATED" if escalated else "FAILED" if had_error else "CLEAN"
 
-    lines: List[str] = [
+    lines: list[str] = [
         f"# {icon} Sentinel Prime — Sprint Audit Log",
         "",
         f"**Timestamp:** {timestamp}  ",
@@ -133,13 +133,13 @@ def write_loop_md(
     LOOP_MD_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _recent_metrics_table(limit: int = 5) -> List[str]:
+def _recent_metrics_table(limit: int = 5) -> list[str]:
     """Last `limit` perf entries from metrics.jsonl, as a markdown table."""
     try:
         if not METRICS_FILE.exists():
             return ["*(no perf entries yet)*", ""]
 
-        perf_entries: List[Dict[str, Any]] = []
+        perf_entries: list[dict[str, Any]] = []
         with METRICS_FILE.open("r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():

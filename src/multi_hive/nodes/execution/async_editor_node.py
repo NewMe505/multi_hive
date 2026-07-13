@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import re
 import traceback
-from typing import Any, Dict
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -50,7 +50,7 @@ def _error_hash(error: str) -> str:
     return hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:8]
 
 
-async def async_editor_node(state: Dict[str, Any]) -> Dict[str, Any]:
+async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     current_task = state.get("current_task")
     if not current_task:
         return {}

@@ -7,7 +7,7 @@ to get a type.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, TypedDict
 
 
 class LoopHealth(TypedDict):
@@ -26,9 +26,9 @@ class LoopHealth(TypedDict):
     """
 
     attempt_count: int
-    repeat_error_hash: Optional[str]
+    repeat_error_hash: str | None
     escalated: bool
-    last_node: Optional[str]
+    last_node: str | None
 
 
 def default_loop_health() -> LoopHealth:
@@ -76,17 +76,17 @@ class HiveState(TypedDict):
 
     messages: Any
     sprint_plan: str
-    project_files: Dict[str, str]
+    project_files: dict[str, str]
     active_file: str
-    task_queue: List[dict]
-    current_task: Optional[str]
-    editor_error: Optional[str]
+    task_queue: list[dict]
+    current_task: str | None
+    editor_error: str | None
     editor_retries: int
     specialist_context: str
     is_ui_task: bool
     loop_health: LoopHealth
     # "PASS", "FAIL: <reason>", or None (not yet evaluated).
     # Reset to None by agent_router_node at the start of each new task.
-    semantic_verdict: Optional[str]
+    semantic_verdict: str | None
     # asyncio.Event — injected per sprint, not checkpointed.
-    human_gate_event: Optional[Any]
+    human_gate_event: Any | None

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any
 
 from multi_hive.state import default_loop_health
 
@@ -14,7 +14,7 @@ SPECIALIST_RULES: dict[tuple[str, ...], str] = {
 _UI_KEYWORDS = {"ui", "tkinter", "gui"}
 
 
-def agent_router_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
     # `or ""` guards the None case — current_task is Optional, and .lower() on
     # None was a recurring crash before the type contract was fixed.
     current_task = (state.get("current_task") or "").lower()

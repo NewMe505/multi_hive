@@ -16,6 +16,7 @@ a sprint over. A terminal too old to draw an emoji prints a placeholder instead.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 
 from rich.console import Console
@@ -26,12 +27,10 @@ def _enable_utf8_output() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:
             continue
-        try:
+        # Detached or already-wrapped stream: nothing to do, and not worth
+        # failing over.
+        with contextlib.suppress(ValueError, OSError):
             reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            # Detached or already-wrapped stream — nothing to do, and not
-            # worth failing over.
-            pass
 
 
 _enable_utf8_output()

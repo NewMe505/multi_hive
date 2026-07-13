@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -32,3 +33,21 @@ packages = ["src/multi_hive"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes — the ones that are real bugs
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+]
+ignore = [
+    "E501",  # line length is handled by the formatter, not the linter
+]

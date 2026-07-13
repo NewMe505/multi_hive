@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from typing import Any, Dict
+from typing import Any
 
 from multi_hive.config import SANDBOX_TIMEOUT_SEC, WORKSPACE_DIR, sandbox_env
 from multi_hive.core.memory import log_rejection
@@ -26,7 +26,7 @@ _MAX_OUTPUT_CHARS = 65536
 _MAX_TRACEBACK_CHARS = 1500
 
 
-def _advance(state: Dict[str, Any], loop_health: Any) -> Dict[str, Any]:
+def _advance(state: dict[str, Any], loop_health: Any) -> dict[str, Any]:
     """Clears the error state and pulls the next task off the queue, if any."""
     task_queue = list(state.get("task_queue", []))
 
@@ -50,7 +50,7 @@ def _advance(state: Dict[str, Any], loop_health: Any) -> Dict[str, Any]:
     }
 
 
-def _fail(state: Dict[str, Any], loop_health: Any, error_msg: str) -> Dict[str, Any]:
+def _fail(state: dict[str, Any], loop_health: Any, error_msg: str) -> dict[str, Any]:
     log_rejection("reviewer_node", error_msg)
     return {
         "editor_error": error_msg,
@@ -59,7 +59,7 @@ def _fail(state: Dict[str, Any], loop_health: Any, error_msg: str) -> Dict[str, 
     }
 
 
-def reviewer_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
     active_file = state.get("active_file")
     if not active_file:
         return {}

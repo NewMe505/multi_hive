@@ -85,7 +85,10 @@ def sandbox_env() -> dict[str, str]:
     }
 
     if os.name == "nt":
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        # Windows upper-cases every key in os.environ, so SYSTEMROOT is the one
+        # that is actually present — "SystemRoot" reads as absent and silently
+        # falls back to the default.
+        system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
         temp_dir = str(OUTPUTS_DIR / ".sandbox_tmp")
         env.update(
             {

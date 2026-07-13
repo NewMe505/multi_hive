@@ -1,0 +1,36 @@
+#!/bin/sh
+# Auto-tag any commit that changes the version in pyproject.toml.
+#
+# This is the "commit a version, get a version" guarantee: whether the bump came
+# from scripts/release.py or from editing pyproject.toml by hand, the resulting
+# commit is always reachable as `v<version>`. An untagged release is a release
+# you cannot check out later.
+#
+# scripts/release.py already creates its own tag; this hook notices that and
+# does nothing, so the two never fight.
+
+extract_version() {
+    # $1 = git revision. Prints the version, or nothing if unreadable.
+    git show "$1:pyproject.toml" 2>/dev/null \
+        | sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' \
+        | head -1
+}
+
+new_version=$(extract_version HEAD)
+[ -z "$new_version" ] && exit 0
+
+# The initial commit has no parent — treat that as "version is new".
+if git rev-parse HEAD~1 >/dev/null 2>&1; then
+    old_version=$(extract_version HEAD~1)
+else
+    old_version=""
+fi
+
+[ "$new_version" = "$old_version" ] && exit 0
+
+if git rev-parse "v$new_version" >/dev/null 2>&1; then
+    exit 0    # already tagged (release.py got here first)
+fi
+
+git tag -a "v$new_version" -m "v$new_version"
+echo "post-commit: version changed ${old_version:-none} -> $new_version, tagged v$new_version"

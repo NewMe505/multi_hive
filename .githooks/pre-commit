@@ -1,0 +1,40 @@
+#!/bin/sh
+# Gate: never commit a broken tree.
+#
+# The suite runs in well under a second, so this costs nothing on a normal
+# commit and catches the class of mistake that is expensive to find later —
+# a broken import, a graph that no longer builds.
+#
+# Bypass deliberately with `git commit --no-verify` when you know you are
+# committing work in progress.
+
+set -e
+
+if [ -x .venv/Scripts/python.exe ]; then
+    PY=.venv/Scripts/python.exe          # Windows
+elif [ -x .venv/bin/python ]; then
+    PY=.venv/bin/python                  # Linux / macOS
+else
+    echo "pre-commit: no .venv found, skipping tests"
+    echo "pre-commit: create one with  python -m venv .venv && pip install -e '.[dev]'"
+    exit 0
+fi
+
+echo "pre-commit: pytest"
+"$PY" -m pytest -q || {
+    echo ""
+    echo "pre-commit: tests failed — commit aborted."
+    echo "pre-commit: fix them, or bypass with  git commit --no-verify"
+    exit 1
+}
+
+# Lint only if ruff is actually installed; a missing dev tool must not block a commit.
+if "$PY" -m ruff --version >/dev/null 2>&1; then
+    echo "pre-commit: ruff"
+    "$PY" -m ruff check src tests scripts || {
+        echo ""
+        echo "pre-commit: lint failed — commit aborted."
+        echo "pre-commit: autofix with  .venv/Scripts/python -m ruff check --fix src tests scripts"
+        exit 1
+    }
+fi

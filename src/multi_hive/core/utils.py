@@ -9,12 +9,11 @@ and rejects anything landing outside workspace/src or workspace/outputs.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
 
 from multi_hive.config import ALLOWED_DIRS, WORKSPACE_DIR
 from multi_hive.core.memory import log_rejection
 
-PathLike = Union[str, Path]
+PathLike = str | Path
 
 
 def safe_path(p: PathLike) -> Path:

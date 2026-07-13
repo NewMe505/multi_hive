@@ -21,9 +21,9 @@ more than once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 from langchain_core.messages import HumanMessage
 from rich.panel import Panel
@@ -49,7 +49,7 @@ class StdinBroker:
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue = asyncio.Queue()
-        self._pump_task: Optional[asyncio.Task] = None
+        self._pump_task: asyncio.Task | None = None
 
     def start(self) -> None:
         if self._pump_task is None:
@@ -64,7 +64,7 @@ class StdinBroker:
                 return
             await self._queue.put(line.rstrip("\n"))
 
-    async def readline(self) -> Optional[str]:
+    async def readline(self) -> str | None:
         """Next line, or None at EOF."""
         item = await self._queue.get()
         return None if item is _EOF else item
@@ -72,10 +72,8 @@ class StdinBroker:
     async def close(self) -> None:
         if self._pump_task is not None:
             self._pump_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._pump_task
-            except asyncio.CancelledError:
-                pass
 
 
 async def _acknowledge_on_input(broker: StdinBroker, gate_event: asyncio.Event) -> None:
@@ -115,9 +113,9 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
     metrics = SprintMetrics()
     metrics.start()
 
-    final_error: Optional[str] = None
+    final_error: str | None = None
     final_loop_health: dict = {}
-    final_semantic: Optional[str] = None
+    final_semantic: str | None = None
 
     ack_task = asyncio.create_task(_acknowledge_on_input(broker, gate_event))
 
@@ -134,10 +132,8 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
                 console.print(f"🔄 [bold cyan]{node_name}[/] executed.")
     finally:
         ack_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await ack_task
-        except asyncio.CancelledError:
-            pass
 
     metrics.stop(llm_cache_size=llm_factory.cache_size())
 

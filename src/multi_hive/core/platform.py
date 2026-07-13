@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, Optional
+from collections.abc import Callable
 
 IS_WINDOWS = os.name == "nt"
 
@@ -105,7 +105,7 @@ def _windows_peak_rss_mb() -> float:
         return 0.0
 
 
-def sandbox_preexec() -> Optional[Callable[[], None]]:
+def sandbox_preexec() -> Callable[[], None] | None:
     """
     SEC-H3: hard resource ceilings for the reviewer sandbox subprocess.
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Dict
+from typing import Any
 
 from rich.panel import Panel
 
@@ -24,7 +24,7 @@ from multi_hive.core.console import console
 from multi_hive.core.memory import log_rejection
 
 
-async def human_gate_node(state: Dict[str, Any]) -> Dict[str, Any]:
+async def human_gate_node(state: dict[str, Any]) -> dict[str, Any]:
     editor_error = state.get("editor_error") or "unknown error"
     current_task = state.get("current_task") or "unknown task"
     active_file = state.get("active_file") or "unknown file"

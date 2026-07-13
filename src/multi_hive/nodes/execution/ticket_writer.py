@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -11,7 +11,7 @@ from multi_hive import prompts
 from multi_hive.core.llm_factory import get_llm
 
 
-def _extract_task_list(raw_text: str) -> List[dict]:
+def _extract_task_list(raw_text: str) -> list[dict]:
     """
     Pulls the JSON task list out of the model's response.
 
@@ -40,7 +40,7 @@ def _extract_task_list(raw_text: str) -> List[dict]:
     ]
 
 
-def ticket_writer(state: Dict[str, Any]) -> Dict[str, Any]:
+def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
     # Explicit None checks, not falsiness: an empty-but-present queue means
     # "the queue was built and drained", which is not the same as "no queue".
     if state.get("task_queue") is not None and len(state.get("task_queue", [])) > 0:

@@ -22,7 +22,7 @@ back through the existing retry loop rather than inventing a second one.
 from __future__ import annotations
 
 import traceback
-from typing import Any, Dict
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -31,7 +31,7 @@ from multi_hive.core.llm_factory import get_async_llm, invalidate_llm
 from multi_hive.core.memory import log_rejection
 
 
-async def semantic_reviewer_node(state: Dict[str, Any]) -> Dict[str, Any]:
+async def semantic_reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
     active_file = state.get("active_file")
     if not active_file:
         return {}
