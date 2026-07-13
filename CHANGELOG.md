@@ -11,6 +11,8 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-07-12
+
 ### Added
 
 - **Model tiering / escalation ladder.** Tasks run on a fast model and escalate
