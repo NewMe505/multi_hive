@@ -11,6 +11,8 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+## [4.5.0] - 2026-07-12
+
 ### Fixed
 
 - **The hive shipped crashing code under a green "✅ Sprint Complete".** The worst
