@@ -158,12 +158,55 @@ Every tuneable is an environment variable — see `config.py`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HIVE_MODEL` | `qwen2.5-coder:7b` | Ollama model tag |
+| `HIVE_PROVIDER` | `ollama` | `ollama` (local) or `anthropic` (Claude API) |
+| `HIVE_FAST_MODEL` | per provider | the model backing the *fast* tier |
+| `HIVE_STRONG_MODEL` | per provider | the model backing the *strong* tier |
+| `HIVE_FORCE_TIER` | — | pin every task to `fast` or `strong`, bypassing the router |
+| `HIVE_MODEL` | `qwen2.5-coder:7b` | back-compat alias for the fast Ollama model |
 | `HIVE_MAX_RETRIES` | `3` | Retries before escalating to the human gate |
 | `HIVE_GATE_TIMEOUT` | `120` | Seconds the gate waits for a human before auto-continuing |
 | `HIVE_SANDBOX_TIMEOUT` | `10` | Seconds generated code may run before it is killed |
 | `HIVE_WORKSPACE` | `workspace` | Where generated code and artefacts land |
 | `HIVE_MAX_INPUT_CHARS` | `4000` | Cap on raw objective text before it hits a context window |
+
+## Running on the Claude API instead of Ollama
+
+The hive is local-first, and the default is unchanged: Ollama, free, offline. But
+the models sit behind a single seam — `core/llm_factory.py` — so the backend is
+one environment variable:
+
+```bash
+pip install -e ".[anthropic]"
+export ANTHROPIC_API_KEY=sk-ant-...
+
+HIVE_PROVIDER=anthropic multi-hive
+HIVE_PROVIDER=anthropic python scripts/bench.py sprint    # A/B it on the benchmark
+```
+
+| tier | `ollama` (default) | `anthropic` |
+|---|---|---|
+| fast | `qwen2.5-coder:7b` | `claude-haiku-4-5` |
+| strong | `qwen3-coder:30b` | `claude-fable-5` |
+
+Override either with `HIVE_FAST_MODEL` / `HIVE_STRONG_MODEL`.
+
+Nothing else changes. The graph, the nodes, the retry loop, the escalation ladder
+and the contracts are all provider-blind — every client is handed to them by
+`llm_factory`, and `tests/test_llm_factory.py` fails the build if any module ever
+constructs one directly. The ladder still climbs; it just climbs *price* instead
+of *parameters*.
+
+Two things worth knowing before you switch:
+
+- **The VRAM story evaporates.** Sticky tiers, the 8 GB ceiling, the dropped 14B,
+  the ~23s reload on escalation — all of that is Ollama's problem and none of it
+  is Claude's. The tier ratchet stays anyway, because "don't downgrade a task that
+  already failed" is good routing wherever the model lives.
+- **`bench.py models` is Ollama-only** and will tell you so. It measures tok/s and
+  GPU placement, which are meaningless for a hosted API. Compare providers with
+  `sprint`, which measures the *system*. Sprint runs are recorded under a
+  provider-tagged subject (`hive@anthropic`), so an API run can never contaminate
+  the local trend line.
 
 ## How the loop protects itself
 

@@ -11,6 +11,37 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`HIVE_PROVIDER` — run the hive on the Claude API instead of local Ollama.**
+  `HIVE_PROVIDER=anthropic` swaps the fast/strong tiers for `claude-haiku-4-5` and
+  `claude-fable-5`. Default is unchanged: local, free, offline.
+
+  This is a change to exactly one module. `core/llm_factory.py` was already the
+  only place a client is constructed — every node asks it for one by
+  `(purpose, tier)` — so the backend was a seam long before anything was plugged
+  into it. The graph, the retry loop, the escalation ladder and the acceptance
+  contracts are all provider-blind. `tests/test_llm_factory.py` fails the build if
+  any module ever constructs a client directly, because that is how a seam quietly
+  stops being one.
+
+  Each provider gets its own parameter table rather than a shared "neutral" one:
+  Ollama speaks `num_predict`/`num_ctx`, Anthropic speaks `max_tokens` and has no
+  context knob at all. Mapping one onto the other would be a leaky abstraction
+  pretending not to be one — and would silently retune the local models, whose
+  numbers are measured.
+
+  Sprint benchmarks are recorded under a provider-tagged subject
+  (`hive@anthropic`), so an API run can never contaminate the local trend line.
+  `bench.py models` stays Ollama-only and says so: it measures tok/s and GPU
+  placement, which mean nothing for a hosted API.
+
+  Note that most of the interesting local engineering — sticky tiers, the 8 GB
+  VRAM ceiling, the dropped 14B, the ~23s reload on escalation — is Ollama's
+  problem and evaporates here. The tier ratchet stays regardless, because "do not
+  downgrade a task that has already failed" is good routing wherever the model
+  lives.
+
 ## [4.6.0] - 2026-07-13
 
 ### Added

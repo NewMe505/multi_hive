@@ -23,6 +23,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
 ]
+# HIVE_PROVIDER=anthropic. Optional: the default provider is local Ollama, and an
+# offline user should not be made to install an API client they never asked for.
+anthropic = [
+    "langchain-anthropic>=0.3",
+]
 
 [project.scripts]
 multi-hive = "multi_hive.cli:run"

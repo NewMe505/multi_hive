@@ -39,8 +39,27 @@ import multi_hive.core.console  # noqa: E402, F401
 from multi_hive.bench import history, runner  # noqa: E402
 from multi_hive.bench.contracts import contract_for_task  # noqa: E402
 from multi_hive.bench.suite import TASKS  # noqa: E402
+from multi_hive.config import MODELS, PROVIDER  # noqa: E402
 
 DEFAULT_MODELS = ["qwen2.5-coder:7b", "qwen3-coder:30b"]
+
+
+def _subject(contract: bool) -> str:
+    """
+    The history key for a sprint run.
+
+    Every axis that changes what is being measured has to be in here, or runs get
+    compared that were never comparable. There are two:
+
+      contract   plain asks "can the hive guess what I meant?", contract asks
+                 "when I say exactly what I want, does it deliver?"
+      provider   a local 7B and Claude are not the same system under test.
+
+    The default (ollama, no contract) keeps the bare subject "hive", so the
+    existing history — and the baselines already in it — stay intact.
+    """
+    subject = "hive+contract" if contract else "hive"
+    return subject if PROVIDER == "ollama" else f"{subject}@{PROVIDER}"
 
 GREEN, RED, DIM, BOLD, RESET = "\033[32m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
 
@@ -53,6 +72,20 @@ def _mark(passed: bool) -> str:
 
 
 def bench_models(models: list[str]) -> list[history.Run]:
+    # This suite talks to Ollama's HTTP API directly, on purpose: its whole job is
+    # answering "which local model should back a tier?", which is a question about
+    # tok/s and GPU placement and has no meaning for a hosted API. To compare
+    # providers, use the `sprint` suite — it goes through llm_factory and measures
+    # the system, which is the thing you actually care about.
+    if PROVIDER != "ollama":
+        print(
+            f"{RED}the `models` suite is Ollama-only{RESET} (it measures tok/s and GPU "
+            f"placement, which mean nothing for {PROVIDER}).\n"
+            f"To compare providers end to end:  "
+            f"{BOLD}HIVE_PROVIDER={PROVIDER} python scripts/bench.py sprint{RESET}"
+        )
+        raise SystemExit(2)
+
     runs = []
     for model in models:
         print(f"\n{BOLD}=== {model} ==={RESET}", flush=True)
@@ -76,39 +109,62 @@ def bench_models(models: list[str]) -> list[history.Run]:
 def bench_sprint(contract: bool = False) -> list[history.Run]:
     label = "full hive + acceptance contracts" if contract else "full hive, end to end"
     print(f"\n{BOLD}=== {label} ==={RESET}", flush=True)
+    print(
+        f"  {DIM}provider={PROVIDER}  fast={MODELS['fast']}  strong={MODELS['strong']}{RESET}",
+        flush=True,
+    )
 
-    # A separate subject, so history.baseline_for() never compares a contract run
-    # against a no-contract one. They answer different questions; a "regression"
-    # between them would be an artefact of the mode, not a change in the code.
-    subject = "hive+contract" if contract else "hive"
-    run = history.Run(suite="sprint", subject=subject).stamp()
+    run = history.Run(suite="sprint", subject=_subject(contract)).stamp()
 
     gamed: list[str] = []
 
-    for task in TASKS:
-        print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
-        result = asyncio.run(
-            runner.run_sprint(task, contract_for_task(task.name) if contract else "")
-        )
-        run.tasks.append(result)
+    async def run_all() -> None:
+        """
+        Every task, in ONE event loop.
 
-        tiers = "→".join(result["tiers"]) or "—"
-        why = f"  {DIM}({result['failure'][:50]}){RESET}" if result["failure"] else ""
-        gate = f" {RED}[human gate]{RESET}" if result["escalated_to_human"] else ""
+        This used to be `asyncio.run()` per task, and that quietly broke the
+        benchmark. `llm_factory` caches the async client, and that client's
+        connection pool is bound to the loop that created it — so task 2 inherited
+        a client pointing at task 1's closed loop and every call raised
+        `Event loop is closed`.
 
-        # Contract satisfied, hidden suite failed: the code cleared the asserts it
-        # was shown and failed the ones it was not. That is the signature of
-        # hardcoding against the contract's literals, and it is the one outcome
-        # that would invalidate the whole approach — so it gets shouted, not
-        # buried in a summary line.
-        if contract and result.get("contract_satisfied") and not result["passed"]:
-            gamed.append(task.name)
-            gate += f" {RED}{BOLD}[CONTRACT GAMED]{RESET}"
+        It does not fail cleanly. The editor catches the error, logs it, and
+        retries; the retry raises the identical error; the repeat-error
+        fingerprint matches, the circuit breaker fires, and the task is escalated
+        to the human gate having never once reached a model. It is scored as a
+        model failure. Observed live: `merge_intervals` recorded as `✗ FAIL
+        (no code) [human gate]` on a task the 7B passes in 80 seconds.
 
-        print(
-            f"{result['wall_sec']:6.1f}s  {result['nodes']:3d} nodes  "
-            f"tier={tiers:12} {_mark(result['passed'])}{gate}{why}"
-        )
+        A benchmark that invents failures is worse than no benchmark, because it
+        is believed. One loop for the process — which is what cli.py always did.
+        """
+        for task in TASKS:
+            print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
+
+            result = await runner.run_sprint(
+                task, contract_for_task(task.name) if contract else ""
+            )
+            run.tasks.append(result)
+
+            tiers = "→".join(result["tiers"]) or "—"
+            why = f"  {DIM}({result['failure'][:50]}){RESET}" if result["failure"] else ""
+            gate = f" {RED}[human gate]{RESET}" if result["escalated_to_human"] else ""
+
+            # Contract satisfied, hidden suite failed: the code cleared the asserts
+            # it was shown and failed the ones it was not. That is the signature of
+            # hardcoding against the contract's literals, and it is the one outcome
+            # that would invalidate the whole approach — so it gets shouted, not
+            # buried in a summary line.
+            if contract and result.get("contract_satisfied") and not result["passed"]:
+                gamed.append(task.name)
+                gate += f" {RED}{BOLD}[CONTRACT GAMED]{RESET}"
+
+            print(
+                f"{result['wall_sec']:6.1f}s  {result['nodes']:3d} nodes  "
+                f"tier={tiers:12} {_mark(result['passed'])}{gate}{why}"
+            )
+
+    asyncio.run(run_all())
 
     if gamed:
         print(

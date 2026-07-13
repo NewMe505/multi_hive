@@ -30,6 +30,17 @@ hidden test suites the model never sees.
 
 The venv is at `.venv`. On Windows, `.venv\Scripts\python.exe`.
 
+## Providers
+
+`HIVE_PROVIDER` is `ollama` (default, local) or `anthropic` (Claude API — needs
+`ANTHROPIC_API_KEY` and `pip install -e ".[anthropic]"`).
+
+`core/llm_factory.py` is the **only** module that may construct a model client.
+Everything else asks it for one by `(purpose, tier)`. Do not `import ChatOllama`
+or `ChatAnthropic` anywhere else — `tests/test_llm_factory.py` scans for it and
+fails the build, because a node that builds its own client silently ignores
+`HIVE_PROVIDER` and nothing would notice until someone switched.
+
 ## Things that will bite you
 
 **This project runs on Windows and Linux.** Both are supported targets, and the

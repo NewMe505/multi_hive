@@ -23,10 +23,28 @@ import os
 import sys
 from pathlib import Path
 
+# ── Provider ──────────────────────────────────────────────────────────────────
+#
+# Where the models actually run. The graph, the nodes, and the escalation ladder
+# do not care — every client comes from core/llm_factory.py, which is the only
+# module that knows a provider exists.
+#
+#   ollama      local, free, offline. The default, and what the whole VRAM story
+#               below is about.
+#   anthropic   the Claude API. Needs ANTHROPIC_API_KEY and
+#               `pip install -e ".[anthropic]"`.
+#
+# The point of having both is that they can be A/B'd on the same benchmark:
+# `HIVE_PROVIDER=anthropic python scripts/bench.py sprint` grades the API models
+# against the same hidden test suites, and records under its own subject so the
+# local trend is never polluted. See bench/history.py.
+
+PROVIDER = os.environ.get("HIVE_PROVIDER", "ollama").strip().lower()
+
 # ── Model tiers ───────────────────────────────────────────────────────────────
 #
 # Two tiers, not three. Measured on the target machine with
-# scripts/bench_models.py (RTX 5070 Laptop, 8 GB VRAM):
+# `scripts/bench.py models` (RTX 5070 Laptop, 8 GB VRAM):
 #
 #   qwen2.5-coder:7b    54.6 tok/s   100% on GPU (4.7/4.7 GB)   <- fast
 #   qwen2.5-coder:14b   11.6 tok/s    61% on GPU (6.0/10.0 GB)  <- dropped
@@ -43,10 +61,35 @@ from pathlib import Path
 # The two tiers cannot both be resident (4.7 + 6.1 GB > 8 GB), so switching
 # tiers evicts and reloads — up to ~23s for the strong model. This is why the
 # tier is sticky per task; see core/model_router.py.
+#
+# NONE of that applies to the anthropic provider: there is no VRAM, no eviction,
+# and no reload, so a tier switch there costs nothing but money. The ratchet
+# stays anyway — see model_router.select_tier — because "do not downgrade a task
+# that has already failed" is good routing regardless of where the model lives.
+
+_DEFAULT_MODELS: dict[str, dict[str, str]] = {
+    "ollama": {
+        "fast": "qwen2.5-coder:7b",
+        "strong": "qwen3-coder:30b",
+    },
+    # Haiku is the cheap first attempt; Fable 5 is the escalation target. The
+    # ladder is unchanged in shape — only the axis it climbs. Locally it climbs
+    # parameters; here it climbs price.
+    "anthropic": {
+        "fast": "claude-haiku-4-5-20251001",
+        "strong": "claude-fable-5",
+    },
+}
+
+if PROVIDER not in _DEFAULT_MODELS:
+    raise ValueError(
+        f"HIVE_PROVIDER={PROVIDER!r} is not a provider. "
+        f"Valid: {', '.join(sorted(_DEFAULT_MODELS))}"
+    )
 
 MODELS: dict[str, str] = {
-    "fast": os.environ.get("HIVE_FAST_MODEL", "qwen2.5-coder:7b"),
-    "strong": os.environ.get("HIVE_STRONG_MODEL", "qwen3-coder:30b"),
+    "fast": os.environ.get("HIVE_FAST_MODEL", _DEFAULT_MODELS[PROVIDER]["fast"]),
+    "strong": os.environ.get("HIVE_STRONG_MODEL", _DEFAULT_MODELS[PROVIDER]["strong"]),
 }
 
 # Retries on the fast model before escalating the task to the strong one.
