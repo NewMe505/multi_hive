@@ -144,6 +144,35 @@ practice the child spends its first ~50 ms loading CPython).
 sized to *survive* unconfined and *die* confined, so the test cannot pass by
 accident on a machine that was merely out of RAM.
 
+## Benchmarks
+
+Two suites, answering different questions. Both grade against **hidden test
+suites the model never sees** — probing the edge cases each task implies but
+does not spell out, because clean-and-confidently-wrong is the failure that
+matters.
+
+```bash
+python scripts/bench.py sprint          # the full hive, end to end
+python scripts/bench.py models          # raw models, no graph
+python scripts/bench.py history         # the trend, run by run
+python scripts/bench.py sprint --check  # exit 1 on a regression
+```
+
+**`sprint` is the one to track.** It drives the real graph — planner, tickets,
+editor, both reviewers, the retry loop, the escalation ladder — and grades the
+file that actually lands on disk. A change that improves the prompts but breaks
+the router looks perfect to `models` and terrible here.
+
+Every run is recorded against the current git commit in
+`workspace/outputs/bench_history.jsonl`, so a regression can be traced to the
+change that caused it. Runs on a dirty tree are recorded but never used as a
+baseline — a benchmark of uncommitted code cannot be reproduced.
+
+`--check` fails on any **quality** drop (code that used to be correct and is not
+any more — no tolerance for that) and on a **speed** drop beyond 25% (local
+inference is noisy; a tighter gate would fire on thermal throttling and be
+ignored within a week).
+
 ## Tests
 
 ```bash

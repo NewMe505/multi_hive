@@ -92,13 +92,19 @@ async def _acknowledge_on_input(broker: StdinBroker, gate_event: asyncio.Event) 
     """
     Sets gate_event when the operator presses Enter during a sprint.
 
+    At EOF it sets the event too. EOF means stdin is a pipe or a closed terminal —
+    there is no human, and no keypress is ever coming. Waiting out the full
+    GATE_TIMEOUT_SEC in that situation stalls every escalation for two minutes to
+    poll a person who does not exist. The timeout is for the case where a human
+    *could* answer and did not; EOF is the case where they could not.
+
     Safe to cancel: it waits on an asyncio.Queue, not on a blocking read.
     """
     while True:
         line = await broker.readline()
-        if line is None:
-            return
         gate_event.set()
+        if line is None:  # EOF — headless. Auto-acknowledge every future gate.
+            return
 
 
 async def run_sprint(user_input: str, broker: StdinBroker) -> None:

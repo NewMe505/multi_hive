@@ -11,6 +11,63 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The hive shipped crashing code under a green "✅ Sprint Complete".** The worst
+  failure this system can have: a false success from the thing whose entire job is
+  verifying its own output.
+
+  `reviewer_node` runs the code and sets `editor_error` when it crashes. The
+  semantic reviewer then ran anyway, judged only *intent*, returned PASS — and a
+  PASS advances the queue, which clears `editor_error` and resets
+  `editor_retries`. So an opinion about intent **erased an execution failure**.
+  The retry counter never climbed, the tier never escalated, and a `semver.py`
+  that raised `TypeError` on import was declared a success. Four crashes in a row,
+  each laundered away by a semantic thumbs-up.
+
+  The semantic reviewer now returns immediately when `editor_error` is set. You
+  cannot approve the intent of a program that does not run.
+
+- **The test suite wrote into the live workspace.** A test mocking a semantic
+  rejection put `FAIL: uses OrderedDict, not a linked list` into the real
+  rejection ledger, where it sat among genuine entries from an unrelated sprint.
+  The same leak would have corrupted `bench_history.jsonl` — the file whose whole
+  purpose is to be a trustworthy record. `tests/conftest.py` now points the
+  workspace at a temp directory before `multi_hive` is imported.
+
+### Added
+
+- **`scripts/bench.py` — a performance tracker, not just a benchmark.** Replaces
+  `bench_models.py`.
+
+  Two suites: `sprint` drives the real graph end-to-end and grades the file that
+  lands on disk (this is the one to track — it catches a change that improves the
+  prompts and breaks the router, which the raw-model suite is blind to); `models`
+  prompts a model directly, for when you are choosing or replacing a tier.
+
+  Every run is recorded against the current git commit, so a regression can be
+  traced to the change that caused it. Runs on a dirty tree are recorded but never
+  used as a baseline — a benchmark of uncommitted code cannot be reproduced.
+
+  `--check` exits non-zero on any **quality** drop (code that used to be correct
+  and is not any more — zero tolerance) or a **speed** drop beyond 25% (local
+  inference is noisy; a tighter gate would fire on thermal throttling and be
+  ignored within a week).
+
+### Verified live
+
+The full escalation ladder, for the first time, on a semver task the 7B provably
+fails:
+
+1. fast tier (`qwen2.5-coder:7b`) wrote code that crashed
+2. `TIER ESCALATION: fast → strong (qwen3-coder:30b)` — the retry went to the
+   better model, rather than re-buying the same failure
+3. the 30B failed too, on the build-metadata rule the benchmark predicted
+4. retries hit the cap → **human gate**
+
+No false success. The system tried a better model, and when that was not enough,
+it stopped and asked for a person.
+
 ## [4.4.0] - 2026-07-12
 
 ### Added

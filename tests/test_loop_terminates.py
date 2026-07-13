@@ -61,6 +61,48 @@ async def test_semantic_pass_retires_the_task_and_pulls_the_next():
     assert delta["editor_error"] is None
 
 
+@pytest.mark.asyncio
+async def test_a_semantic_pass_cannot_erase_an_execution_failure():
+    """
+    The worst bug this system has had: it shipped crashing code under a green
+    "✅ Sprint Complete".
+
+    reviewer_node runs the code and sets editor_error when it crashes. The
+    semantic reviewer then ran anyway, judged only *intent*, said PASS — and PASS
+    calls _advance(), which clears editor_error and resets editor_retries. So the
+    execution failure was erased by an opinion about intent. The retry counter
+    never climbed, the tier never escalated, and a semver.py that raised
+    TypeError on import was declared a success. Four crashes in a row, all wiped.
+
+    You cannot approve the intent of a program that does not run.
+    """
+    state = {
+        "active_file": "outputs/semver.py",
+        "project_files": {"outputs/semver.py": "raise TypeError('boom')"},
+        "task_queue": [{"task": "next", "file": "outputs/b.py"}],
+        "current_task": "implement compare_semver",
+        "editor_error": "TRACEBACK: TypeError: int() argument must be...",  # it crashed
+        "editor_retries": 1,
+        "loop_health": default_loop_health(),
+    }
+
+    with patch("multi_hive.nodes.execution.semantic_reviewer_node.get_async_llm") as llm:
+        llm.return_value.ainvoke = AsyncMock(return_value=type("R", (), {"content": "PASS"})())
+        delta = await semantic_reviewer_node(state)
+
+    # It must not even ask the model — reviewing unrunnable code is meaningless.
+    llm.assert_not_called()
+
+    # And crucially, it must not launder the failure away.
+    assert "editor_error" not in delta, "a semantic PASS erased an execution failure"
+    assert "editor_retries" not in delta, "the retry counter was reset despite a crash"
+    assert "current_task" not in delta, "the graph advanced past code that does not run"
+
+    # The error survives, so the router sends it back to the editor to be fixed.
+    state.update(delta)
+    assert reviewer_logic(state) == "async_editor_node"
+
+
 def test_an_error_with_no_task_cannot_be_retried():
     """
     The second live loop, and the nastier one: an error with no task behind it.

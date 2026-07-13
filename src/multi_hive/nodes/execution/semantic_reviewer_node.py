@@ -66,6 +66,26 @@ def _advance(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def semantic_reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
+    # Execution already failed — reviewer_node set editor_error because the code
+    # crashed or failed its own asserts.
+    #
+    # Do not review it, and above all do not advance past it. Semantic review
+    # asks "is this the right program?", which is a question with no meaning for
+    # a program that does not run. Worse, a PASS here calls _advance(), which
+    # clears editor_error and resets editor_retries — so a semantic thumbs-up
+    # would erase an execution failure, the retry counter would never climb, the
+    # tier would never escalate, and the sprint would ship crashing code under a
+    # green "✅ Sprint Complete".
+    #
+    # That is exactly what happened: four reviewer_node crashes in a row, each
+    # wiped by a semantic PASS, and a semver.py that raised TypeError on import
+    # was declared a success.
+    #
+    # Returning {} leaves editor_error in place, so reviewer_logic routes back to
+    # the editor, which is where a broken program belongs.
+    if state.get("editor_error"):
+        return {}
+
     active_file = state.get("active_file")
     if not active_file:
         return {}
