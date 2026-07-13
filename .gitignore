@@ -9,3 +9,11 @@ venv/
 
 # Generated code and hive artefacts (ledger, metrics, LOOP.md).
 workspace/
+
+# Secrets. HIVE_PROVIDER=anthropic needs ANTHROPIC_API_KEY, and the single most
+# common way to leak an API key is to put it in a file next to the code that
+# reads it and then forget. These are ignored before they exist, not after.
+.env
+.env.*
+.anthropic_key
+*.key
