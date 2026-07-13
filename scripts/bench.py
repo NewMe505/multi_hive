@@ -1,13 +1,31 @@
 """
 bench.py — the performance tracker.
 
-    python scripts/bench.py sprint              # the one to track during development
+    python scripts/bench.py sprint --repeat 3   # the one to track during development
     python scripts/bench.py sprint --contract   # with human-written acceptance contracts
     python scripts/bench.py models              # when choosing or replacing a tier
     python scripts/bench.py models --models qwen2.5-coder:7b qwen3-coder:30b
 
     python scripts/bench.py sprint --check      # exit 1 on a regression (CI gate)
     python scripts/bench.py history             # the trend, run by run
+
+One run is a sample, not a measurement
+--------------------------------------
+The models are sampled at temperature 0.1, the retry loop is driven by whatever
+they happened to emit, and a single unlucky generation cascades: one bad attempt
+escalates the tier, which pays a ~23s model reload, which moves the wall clock by
+minutes. Two runs of *identical code* can differ by 40% on time and by a whole
+task on quality.
+
+So `--repeat N` runs the suite N times, and **a task counts as passed only if it
+passes every run.** A task that passes 2 of 3 has not been fixed; it has been made
+likely, and scoring it as a win reports a coin landing heads. Those are printed as
+FLAKY and counted as failures. Wall time is reported as the median, because a mean
+lets a single reload tell a story about the weather.
+
+Use `--repeat 3` before believing any conclusion. This is not a hypothetical
+caution: a single-run comparison on this suite produced a confident "1.45x speed
+regression" that was, on investigation, a harness bug plus noise.
 
 Every run is recorded against the current git commit, so a regression can be
 traced to the change that caused it. Runs on a dirty tree are recorded but never
@@ -28,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import statistics
 import sys
 from pathlib import Path
 
@@ -106,21 +125,43 @@ def bench_models(models: list[str]) -> list[history.Run]:
     return runs
 
 
-def bench_sprint(contract: bool = False) -> list[history.Run]:
+async def _warmup() -> None:
+    """
+    Load the fast model before the clock starts on task 1.
+
+    Otherwise the first task of a run pays a cold model load that the other three
+    do not, and it looks slower for a reason that has nothing to do with the code
+    under test. The strong model's ~23s load is deliberately NOT warmed: it is
+    paid only when a task escalates, and that cost is a real property of the
+    escalation ladder. Hiding it would flatter the benchmark.
+    """
+    from langchain_core.messages import HumanMessage
+
+    from multi_hive.core.llm_factory import get_async_llm
+
+    print(f"  {DIM}warming {MODELS['fast']}...{RESET}", end="", flush=True)
+    try:
+        await get_async_llm("editor", "fast").ainvoke([HumanMessage(content="ok")])
+        print(f"\r  {DIM}warmed {MODELS['fast']}{' ' * 20}{RESET}", flush=True)
+    except Exception as e:
+        print(f"\r  {RED}warmup failed: {e}{RESET}", flush=True)
+
+
+def bench_sprint(contract: bool = False, repeat: int = 1) -> list[history.Run]:
     label = "full hive + acceptance contracts" if contract else "full hive, end to end"
     print(f"\n{BOLD}=== {label} ==={RESET}", flush=True)
     print(
-        f"  {DIM}provider={PROVIDER}  fast={MODELS['fast']}  strong={MODELS['strong']}{RESET}",
+        f"  {DIM}provider={PROVIDER}  fast={MODELS['fast']}  strong={MODELS['strong']}"
+        f"  repeat={repeat}{RESET}",
         flush=True,
     )
 
-    run = history.Run(suite="sprint", subject=_subject(contract)).stamp()
-
-    gamed: list[str] = []
+    # task name -> one result per repeat
+    results: dict[str, list[dict]] = {task.name: [] for task in TASKS}
 
     async def run_all() -> None:
         """
-        Every task, in ONE event loop.
+        Every task, every repeat, in ONE event loop.
 
         This used to be `asyncio.run()` per task, and that quietly broke the
         benchmark. `llm_factory` caches the async client, and that client's
@@ -138,33 +179,111 @@ def bench_sprint(contract: bool = False) -> list[history.Run]:
         A benchmark that invents failures is worse than no benchmark, because it
         is believed. One loop for the process — which is what cli.py always did.
         """
-        for task in TASKS:
-            print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
+        await _warmup()
 
-            result = await runner.run_sprint(
-                task, contract_for_task(task.name) if contract else ""
-            )
-            run.tasks.append(result)
+        for rep in range(repeat):
+            if repeat > 1:
+                print(f"\n  {BOLD}run {rep + 1}/{repeat}{RESET}", flush=True)
 
-            tiers = "→".join(result["tiers"]) or "—"
-            why = f"  {DIM}({result['failure'][:50]}){RESET}" if result["failure"] else ""
-            gate = f" {RED}[human gate]{RESET}" if result["escalated_to_human"] else ""
+            for task in TASKS:
+                print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
 
-            # Contract satisfied, hidden suite failed: the code cleared the asserts
-            # it was shown and failed the ones it was not. That is the signature of
-            # hardcoding against the contract's literals, and it is the one outcome
-            # that would invalidate the whole approach — so it gets shouted, not
-            # buried in a summary line.
-            if contract and result.get("contract_satisfied") and not result["passed"]:
-                gamed.append(task.name)
-                gate += f" {RED}{BOLD}[CONTRACT GAMED]{RESET}"
+                result = await runner.run_sprint(
+                    task, contract_for_task(task.name) if contract else ""
+                )
+                results[task.name].append(result)
 
-            print(
-                f"{result['wall_sec']:6.1f}s  {result['nodes']:3d} nodes  "
-                f"tier={tiers:12} {_mark(result['passed'])}{gate}{why}"
-            )
+                tiers = "→".join(result["tiers"]) or "—"
+                why = f"  {DIM}({result['failure'][:44]}){RESET}" if result["failure"] else ""
+                gate = f" {RED}[human gate]{RESET}" if result["escalated_to_human"] else ""
+
+                # Contract satisfied, hidden suite failed: the code cleared the
+                # asserts it was shown and failed the ones it was not. That is the
+                # signature of hardcoding against the contract's literals, and it
+                # is the one outcome that would invalidate the whole approach — so
+                # it gets shouted, not buried in a summary line.
+                if contract and result.get("contract_satisfied") and not result["passed"]:
+                    gate += f" {RED}{BOLD}[CONTRACT GAMED]{RESET}"
+
+                print(
+                    f"{result['wall_sec']:6.1f}s  {result['nodes']:3d} nodes  "
+                    f"tier={tiers:12} {_mark(result['passed'])}{gate}{why}"
+                )
 
     asyncio.run(run_all())
+
+    return [_aggregate(results, contract, repeat)]
+
+
+def _aggregate(results: dict[str, list[dict]], contract: bool, repeat: int) -> history.Run:
+    """
+    Collapse N repeats into one Run, and say out loud what was thrown away.
+
+    `passed` means passed **every** repeat. That is the strict definition on
+    purpose: a task that passes 2 runs in 3 has not been fixed, it has been made
+    likely, and a benchmark that scores it as a win will report a "quality
+    improvement" that is really a coin landing heads. The pass_rate is kept
+    alongside so the flakiness is visible rather than rounded away.
+
+    `wall_sec` is the MEDIAN, not the mean. One task hitting a 23s model reload,
+    or the OS deciding to index something mid-run, drags a mean into telling a
+    story about the weather.
+    """
+    run = history.Run(suite="sprint", subject=_subject(contract)).stamp()
+
+    flaky: list[str] = []
+    gamed: list[str] = []
+
+    for task in TASKS:
+        runs = results[task.name]
+        if not runs:
+            continue
+
+        passes = sum(1 for r in runs if r["passed"])
+        walls = sorted(r["wall_sec"] for r in runs)
+        failures = [r["failure"] for r in runs if r["failure"]]
+
+        if 0 < passes < len(runs):
+            flaky.append(f"{task.name} ({passes}/{len(runs)})")
+        if contract and any(r.get("contract_satisfied") and not r["passed"] for r in runs):
+            gamed.append(task.name)
+
+        run.tasks.append(
+            {
+                "task": task.name,
+                "complexity": task.complexity,
+                "passed": passes == len(runs),  # reliably, not luckily
+                "pass_rate": round(passes / len(runs), 3),
+                "repeats": len(runs),
+                "wall_sec": statistics.median(walls),
+                "wall_min": min(walls),
+                "wall_max": max(walls),
+                "nodes": statistics.median([r["nodes"] for r in runs]),
+                "tiers": runs[0]["tiers"],
+                "escalated_to_human": any(r["escalated_to_human"] for r in runs),
+                "contract_satisfied": any(r.get("contract_satisfied") for r in runs),
+                "failure": failures[0][:120] if failures else "",
+            }
+        )
+
+    if repeat > 1:
+        print(f"\n{BOLD}  aggregate over {repeat} runs{RESET}")
+        print(f"  {DIM}{'task':16} {'passed':>8}  {'median':>7}  {'min':>7}  {'max':>7}{RESET}")
+        for t in run.tasks:
+            colour = GREEN if t["passed"] else (RED if t["pass_rate"] == 0 else "\033[33m")
+            count = f"{round(t['pass_rate'] * t['repeats'])}/{t['repeats']}"
+            print(
+                f"  {t['task']:16} {colour}{count:>8}{RESET}  "
+                f"{t['wall_sec']:6.1f}s  {t['wall_min']:6.1f}s  {t['wall_max']:6.1f}s"
+            )
+
+    if flaky:
+        print(
+            f"\n  {BOLD}\033[33mFLAKY: {', '.join(flaky)}{RESET}\n"
+            f"  {DIM}These tasks pass sometimes. A single run of any of them proves nothing,\n"
+            f"  and scoring one as a win would be reporting a coin landing heads. They are\n"
+            f"  counted as NOT passed — `passed` here means passed every run.{RESET}"
+        )
 
     if gamed:
         print(
@@ -174,7 +293,7 @@ def bench_sprint(contract: bool = False) -> list[history.Run]:
             f"anti-hardcoding rule in prompts._EDITOR_CONTRACT_PREFIX.{RESET}"
         )
 
-    return [run]
+    return run
 
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
@@ -261,15 +380,28 @@ def main() -> None:
             "Recorded as a separate subject; not comparable to a plain sprint run."
         ),
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "run the suite N times and aggregate. A task counts as passed only if "
+            "it passes every run. Use N>=3 before believing anything."
+        ),
+    )
     args = parser.parse_args()
 
     if args.suite == "history":
         raise SystemExit(show_history())
 
+    if args.repeat < 1:
+        raise SystemExit("--repeat must be at least 1")
+
     runs = (
         bench_models(args.models)
         if args.suite == "models"
-        else bench_sprint(contract=args.contract)
+        else bench_sprint(contract=args.contract, repeat=args.repeat)
     )
     raise SystemExit(report(runs, args.check))
 
