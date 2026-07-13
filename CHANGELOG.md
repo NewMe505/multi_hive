@@ -11,6 +11,8 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+## [4.4.0] - 2026-07-12
+
 ### Added
 
 - **The Windows sandbox now enforces its ceilings.** Generated code is untrusted
