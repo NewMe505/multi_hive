@@ -13,6 +13,75 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Added
 
+- **Model tiering / escalation ladder.** Tasks run on a fast model and escalate
+  to a strong one when it fails. `core/model_router.py` picks the tier from a
+  cheap text-only complexity prior plus the failure history; `core/llm_factory.py`
+  now caches clients by `(purpose, tier)`. Chosen from measurements on the target
+  machine, not leaderboards — see `scripts/bench_models.py`:
+
+  | model | tok/s | GPU placement | |
+  |---|---|---|---|
+  | qwen2.5-coder:7b | 54.6 | 100% (4.7/4.7 GB) | **fast tier** |
+  | qwen2.5-coder:14b | 11.6 | 61% (6.0/10.0 GB) | dropped |
+  | qwen3-coder:30b | 37.0 | 32% (6.1/19.2 GB) | **strong tier** |
+
+  The 14B is the "almost fits" trap: a *dense* model 39% off-GPU, 5× slower than
+  the 7B for no measured gain. The 30B is faster despite being twice the size
+  because it is mixture-of-experts (~3B active per token).
+
+  The tier is **sticky per task**: the two models do not fit in 8 GB of VRAM
+  together, so a design where the small model writes and the big one reviews
+  every task would evict and reload on every task, paying a ~23s load twice over.
+
+- `scripts/bench_models.py` — measures tok/s, GPU placement, and code quality
+  against **hidden test suites** the model never sees.
+
+### Fixed
+
+- **The sprint loop could not terminate.** Two independent, separately fatal bugs,
+  both found by running the thing rather than by reading it:
+
+  1. `reviewer_node` retired a task the moment its code *executed* — popping the
+     queue, clearing `current_task`, zeroing `editor_retries`. But
+     `semantic_reviewer_node` runs *after* it. A semantic rejection therefore
+     landed on an already-finished task: the editor regenerated nothing (`if not
+     current_task: return {}`) and the retry cap was unreachable (the counter had
+     just been zeroed). Both safety mechanisms failed at once. **Observed live:
+     992 identical semantic rejections, zero escalations.** A task is now retired
+     only by the last gate to run, which is the only node that knows both
+     reviewers passed.
+
+  2. `reviewer_logic` routed an `editor_error` back to the editor even with no
+     `current_task` to retry. The editor no-ops, the reviewers no-op, so nothing
+     ever bumps `editor_retries` and the cap is never reached — an unkillable,
+     completely silent loop. Reachable whenever `ticket_writer` gets unparseable
+     JSON back. **Observed live: 10,007 graph steps and an empty ledger.** You
+     cannot retry a task that does not exist; it now escalates.
+
+- **The repeat-error circuit breaker was disarmed.** `async_editor_node` cleared
+  the error fingerprint whenever *generation* succeeded — but generation nearly
+  always succeeds; the failure arrives later, from a reviewer. So the evidence
+  that the last attempt failed the same way was wiped every cycle, and the
+  breaker never fired for the failures it exists to catch.
+
+- **`ticket_writer` failed silently.** Its JSON-parse failure now reaches the
+  rejection ledger; its silence is what made the loop above invisible.
+
+- **A `None` state delta from LangGraph killed the sprint** after all the work
+  was already done (`TypeError: argument of type 'NoneType' is not iterable`).
+
+- **The stdin broker deadlocked at EOF.** Two consumers, one EOF marker: whichever
+  reached it first swallowed it, leaving the other blocked forever on a queue no
+  producer would fill again. EOF is now sticky.
+
+### Changed
+
+- `RECURSION_LIMIT` (default 120) caps graph steps per sprint. LangGraph's 10,007
+  default meant a routing cycle burned twenty minutes before surfacing; this fails
+  in seconds. A backstop, not a working limit.
+
+### Added
+
 - `scripts/release.py` — bumps the version, dates the changelog, commits, and
   tags. Refuses to run on a dirty tree, on failing tests, or with an empty
   Unreleased section.

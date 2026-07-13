@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from multi_hive import prompts
 from multi_hive.core.llm_factory import get_llm
+from multi_hive.core.memory import log_rejection
 
 
 def _extract_task_list(raw_text: str) -> list[dict]:
@@ -71,8 +72,14 @@ def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
     tasks = _extract_task_list(response.content)
 
     if not tasks:
+        # Log it. This failure produces an editor_error with no task queue behind
+        # it, which is a state the router has to handle specially — and when it
+        # went unlogged, the resulting loop was invisible: an empty ledger and no
+        # clue why the sprint was spinning.
+        error = "JSON PARSE ERROR: TicketWriter did not output valid JSON."
+        log_rejection("ticket_writer", f"{error}\nRaw response:\n{response.content[:600]}")
         return {
-            "editor_error": "JSON PARSE ERROR: TicketWriter did not output valid JSON.",
+            "editor_error": error,
             "editor_retries": 1,
         }
 

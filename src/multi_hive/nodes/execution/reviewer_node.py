@@ -26,28 +26,23 @@ _MAX_OUTPUT_CHARS = 65536
 _MAX_TRACEBACK_CHARS = 1500
 
 
-def _advance(state: dict[str, Any], loop_health: Any) -> dict[str, Any]:
-    """Clears the error state and pulls the next task off the queue, if any."""
-    task_queue = list(state.get("task_queue", []))
+def _executes(loop_health: Any) -> dict[str, Any]:
+    """
+    The code ran. That is ALL this node is entitled to say.
 
-    if task_queue:
-        nxt = task_queue.pop(0)
-        return {
-            "editor_error": None,
-            "editor_retries": 0,
-            "task_queue": task_queue,
-            "current_task": nxt["task"],
-            "active_file": nxt["file"],
-            "loop_health": loop_health,
-        }
+    It deliberately does not advance the task queue, clear current_task, or
+    reset editor_retries. Declaring the task finished here is what broke the
+    loop: semantic_reviewer_node runs *after* this node, so a task marked
+    complete on execution alone could still be rejected on intent — and by then
+    current_task was None (so the editor regenerated nothing) and editor_retries
+    was 0 (so MAX_RETRIES was unreachable). The sprint then cycled forever,
+    re-validating identical code. Observed in the wild: 992 identical semantic
+    rejections, zero escalations.
 
-    return {
-        "editor_error": None,
-        "editor_retries": 0,
-        "task_queue": [],
-        "current_task": None,
-        "loop_health": loop_health,
-    }
+    A task is finished when BOTH reviewers pass, and only semantic_reviewer_node
+    is in a position to know that. Advancement lives there now.
+    """
+    return {"editor_error": None, "loop_health": loop_health}
 
 
 def _fail(state: dict[str, Any], loop_health: Any, error_msg: str) -> dict[str, Any]:
@@ -88,7 +83,7 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # ── UI tasks skip execution: the window would block forever ──────────────
     if state.get("is_ui_task"):
-        return _advance(state, loop_health)
+        return _executes(loop_health)
 
     # ── Sandboxed execution ───────────────────────────────────────────────────
     proc = subprocess.Popen(
@@ -114,6 +109,6 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
         passed = False
 
     if passed:
-        return _advance(state, loop_health)
+        return _executes(loop_health)
 
     return _fail(state, loop_health, "TRACEBACK:\n" + output[-_MAX_TRACEBACK_CHARS:])

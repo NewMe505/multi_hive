@@ -27,8 +27,42 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from multi_hive import prompts
-from multi_hive.core.llm_factory import get_async_llm, invalidate_llm
+from multi_hive.core.llm_factory import DEFAULT_TIER, get_async_llm, invalidate_llm
 from multi_hive.core.memory import log_rejection
+
+
+def _advance(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    Declare the current task finished and pull the next one off the queue.
+
+    This is the ONLY place a task is retired, because this is the last gate: the
+    code has executed (reviewer_node) and it implements what was asked
+    (this node). Advancing any earlier — as reviewer_node used to, on execution
+    alone — lets a task be retired and then rejected, which leaves the editor
+    with nothing to regenerate and the retry counter reset to zero on every
+    cycle. The sprint cannot then make progress or terminate.
+
+    Resetting editor_retries here is safe precisely because the task really is
+    done; the counter belongs to the task, and the task is over.
+    """
+    task_queue = list(state.get("task_queue", []))
+
+    if task_queue:
+        nxt = task_queue.pop(0)
+        return {
+            "editor_error": None,
+            "editor_retries": 0,
+            "task_queue": task_queue,
+            "current_task": nxt["task"],
+            "active_file": nxt["file"],
+        }
+
+    return {
+        "editor_error": None,
+        "editor_retries": 0,
+        "task_queue": [],
+        "current_task": None,
+    }
 
 
 async def semantic_reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -50,25 +84,40 @@ async def semantic_reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
         state.get("current_task") or "",
     )
 
+    # Review on whatever tier the editor used for this task, rather than always
+    # reaching for the strong model. The two models cannot both sit in 8 GB of
+    # VRAM, so a small-writes/large-reviews split would evict and reload on
+    # every single task — paying the strong model's ~23s load twice per task to
+    # review code the fast model probably got right.
+    #
+    # An escalated task therefore gets a stronger reviewer for free, because it
+    # is already on the strong tier. That is the case where the extra scrutiny
+    # is actually warranted: the fast model has already failed here once.
+    tier = state.get("model_tier") or DEFAULT_TIER
+
     try:
-        llm = get_async_llm("reviewer")
+        llm = get_async_llm("reviewer", tier)
         response = await llm.ainvoke(
             [SystemMessage(content=sys_prompt), HumanMessage(content=current_code)]
         )
         raw_verdict = response.content.strip()
     except Exception as e:
-        invalidate_llm("reviewer")
+        invalidate_llm("reviewer", tier)
         log_rejection(
             "semantic_reviewer_node",
             f"LLM call failed: {e}\n{traceback.format_exc()}",
         )
         # Infrastructure failure is not a code failure. Pass, and leave the
         # forensics in the ledger, rather than blocking a sprint on a dead
-        # Ollama connection.
-        return {"semantic_verdict": "PASS (semantic review skipped — LLM error)"}
+        # Ollama connection. It must still advance: a "pass" that does not
+        # retire the task leaves the graph re-reviewing it forever.
+        return {
+            "semantic_verdict": "PASS (semantic review skipped — LLM error)",
+            **_advance(state),
+        }
 
     if not raw_verdict.upper().startswith("FAIL"):
-        return {"semantic_verdict": "PASS"}
+        return {"semantic_verdict": "PASS", **_advance(state)}
 
     # Normalise to "FAIL: <reason>".
     if ":" in raw_verdict:

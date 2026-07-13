@@ -22,8 +22,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from multi_hive import prompts
 from multi_hive.core.ast_utils import get_code_outline
-from multi_hive.core.llm_factory import get_async_llm, invalidate_llm
+from multi_hive.core.llm_factory import get_async_llm, invalidate_llm, model_for
 from multi_hive.core.memory import get_recent_rejections, log_rejection
+from multi_hive.core.model_router import STRONG, classify_complexity, select_tier
 from multi_hive.state import default_loop_health
 
 _MAX_OBJECTIVE_CHARS = 2000
@@ -87,6 +88,32 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     loop_health["attempt_count"] = loop_health.get("attempt_count", 0) + 1
     loop_health["last_node"] = "async_editor_node"
 
+    # ── Model tier ────────────────────────────────────────────────────────────
+    # Escalate to the strong model once the fast one has failed this task.
+    # Retrying a failure with the model that just produced it mostly re-buys the
+    # failure; the retry budget is only worth what it changes.
+    #
+    # The tier ratchets upward and never falls back within a task: the two models
+    # do not fit in VRAM together, so flip-flopping would evict and reload on
+    # every attempt.
+    previous_tier = state.get("model_tier")
+    complexity = state.get("task_complexity") or classify_complexity(current_task)
+    tier = select_tier(
+        complexity,
+        editor_retries=state.get("editor_retries", 0),
+        repeat_error=loop_health.get("repeat_error_hash") is not None and bool(editor_error),
+    )
+    if previous_tier == STRONG:
+        tier = STRONG
+
+    if tier != previous_tier:
+        log_rejection(
+            "async_editor_node",
+            f"TIER ESCALATION: {previous_tier or 'fast'} -> {tier} "
+            f"({model_for(tier)}) after {state.get('editor_retries', 0)} failed "
+            f"attempt(s) on a task classified {complexity!r}.",
+        )
+
     # ── Prompt assembly ───────────────────────────────────────────────────────
     human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
     raw_objective = human_msgs[0].content if human_msgs else ""
@@ -134,28 +161,40 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # ── Generation ────────────────────────────────────────────────────────────
     try:
-        llm = get_async_llm("editor")
+        llm = get_async_llm("editor", tier)
         response = await llm.ainvoke(
             [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
         )
         project_files[active_file] = _extract_clean_code(response.content)
 
-        # Clear the fingerprint on success so the next task starts clean.
-        loop_health["repeat_error_hash"] = None
+        # The fingerprint is deliberately NOT cleared here.
+        #
+        # Generating code is not the same as succeeding at the task. Generation
+        # almost always "succeeds" — the failure arrives later, from the reviewer
+        # or the semantic reviewer. Clearing the fingerprint on generation
+        # therefore disarmed the repeat-error circuit breaker for exactly the
+        # failures it exists to catch: every cycle wiped the evidence that the
+        # last attempt failed the same way, so the same rejection could repeat
+        # indefinitely without ever tripping an escalation.
+        #
+        # agent_router_node resets loop_health at the start of each new task,
+        # which is the correct place for a clean slate.
 
         return {
             "project_files": project_files,
             "active_file": active_file,
             "editor_error": None,
             "loop_health": loop_health,
+            "model_tier": tier,
+            "task_complexity": complexity,
             "messages": state.get("messages", [])
-            + [AIMessage(content=f"[{active_file}] Task written.")],
+            + [AIMessage(content=f"[{active_file}] Task written by {model_for(tier)}.")],
         }
 
     except Exception as e:
         # A connection-level failure means the cached client may be dead —
         # drop it so the next attempt rebuilds against a restarted Ollama.
-        invalidate_llm("editor")
+        invalidate_llm("editor", tier)
         log_rejection(
             "async_editor_node",
             f"Generation Error: {e}\n{traceback.format_exc()}",
@@ -163,6 +202,8 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "editor_error": str(e),
             "loop_health": loop_health,
+            "model_tier": tier,
+            "task_complexity": complexity,
             "messages": state.get("messages", [])
             + [AIMessage(content=f"SYSTEM ERROR IN EDITOR: {e}")],
         }

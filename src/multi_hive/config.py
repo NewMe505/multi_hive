@@ -23,10 +23,59 @@ import os
 import sys
 from pathlib import Path
 
-# ── Model / loop tuning ───────────────────────────────────────────────────────
+# ── Model tiers ───────────────────────────────────────────────────────────────
+#
+# Two tiers, not three. Measured on the target machine with
+# scripts/bench_models.py (RTX 5070 Laptop, 8 GB VRAM):
+#
+#   qwen2.5-coder:7b    54.6 tok/s   100% on GPU (4.7/4.7 GB)   <- fast
+#   qwen2.5-coder:14b   11.6 tok/s    61% on GPU (6.0/10.0 GB)  <- dropped
+#   qwen3-coder:30b     37.0 tok/s    32% on GPU (6.1/19.2 GB)  <- strong
+#
+# The 14B is dropped on purpose: it is the "almost fits" trap. 10 GB into 8 GB
+# of VRAM spills 39% of a *dense* model to the CPU, and a dense model touches
+# every parameter for every token — 5x slower than the 7B for no measured gain.
+#
+# The 30B is faster than the 14B despite being twice the size because it is
+# mixture-of-experts: ~3B parameters active per token. Bigger model, less
+# VRAM-bound, faster.
+#
+# The two tiers cannot both be resident (4.7 + 6.1 GB > 8 GB), so switching
+# tiers evicts and reloads — up to ~23s for the strong model. This is why the
+# tier is sticky per task; see core/model_router.py.
 
-MODEL_NAME = os.environ.get("HIVE_MODEL", "qwen2.5-coder:7b")
+MODELS: dict[str, str] = {
+    "fast": os.environ.get("HIVE_FAST_MODEL", "qwen2.5-coder:7b"),
+    "strong": os.environ.get("HIVE_STRONG_MODEL", "qwen3-coder:30b"),
+}
+
+# Retries on the fast model before escalating the task to the strong one.
+# 1 means: one failure is enough evidence that another identical attempt is
+# not worth its cost.
+ESCALATE_AFTER_FAILURES = int(os.environ.get("HIVE_ESCALATE_AFTER", "1"))
+
+# Pin every task to one tier, bypassing the router. "fast" | "strong" | "".
+# Useful for benchmarking, and for the case where Ollama is on a machine with
+# enough VRAM that none of the above trade-offs apply.
+FORCE_TIER = os.environ.get("HIVE_FORCE_TIER", "").strip().lower()
+
+# Back-compat: the single-model name, still honoured if someone sets HIVE_MODEL.
+MODEL_NAME = os.environ.get("HIVE_MODEL", MODELS["fast"])
+if os.environ.get("HIVE_MODEL"):
+    MODELS["fast"] = MODEL_NAME
+
+# ── Loop tuning ───────────────────────────────────────────────────────────────
+
 MAX_RETRIES = int(os.environ.get("HIVE_MAX_RETRIES", "3"))
+
+# Hard ceiling on graph steps per sprint — a backstop, not a working limit.
+#
+# A healthy sprint is a handful of nodes per task. LangGraph's own default is
+# 25, and it was raised here only because the fallback is what you want to hit
+# *fast* when a routing bug produces a cycle no state change can break. Left at
+# LangGraph's 10,007-step default, one such loop burned twenty minutes and
+# 10,007 LLM-free no-ops before surfacing. Failing at 120 surfaces it in seconds.
+RECURSION_LIMIT = int(os.environ.get("HIVE_RECURSION_LIMIT", "120"))
 
 # How long human_gate_node waits for operator acknowledgement before routing to
 # retrospector automatically (headless / CI fallback).

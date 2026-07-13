@@ -29,7 +29,12 @@ from langchain_core.messages import HumanMessage
 from rich.panel import Panel
 
 from multi_hive import __version__
-from multi_hive.config import MAX_INPUT_CHARS, WORKSPACE_DIR, ensure_workspace
+from multi_hive.config import (
+    MAX_INPUT_CHARS,
+    RECURSION_LIMIT,
+    WORKSPACE_DIR,
+    ensure_workspace,
+)
 from multi_hive.core import llm_factory
 from multi_hive.core.console import console
 from multi_hive.core.memory import clear_ledger
@@ -67,7 +72,14 @@ class StdinBroker:
     async def readline(self) -> str | None:
         """Next line, or None at EOF."""
         item = await self._queue.get()
-        return None if item is _EOF else item
+        if item is _EOF:
+            # EOF is sticky. There are two consumers — the REPL and the gate's
+            # acknowledgement task — and whichever reaches the marker first would
+            # otherwise swallow it, leaving the other blocked on a queue that no
+            # producer will ever fill again. Putting it back makes EOF idempotent.
+            await self._queue.put(_EOF)
+            return None
+        return item
 
     async def close(self) -> None:
         if self._pump_task is not None:
@@ -107,6 +119,8 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
         "is_ui_task": False,
         "loop_health": default_loop_health(),
         "semantic_verdict": None,
+        "task_complexity": None,
+        "model_tier": None,
         "human_gate_event": gate_event,
     }
 
@@ -116,18 +130,37 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
     final_error: str | None = None
     final_loop_health: dict = {}
     final_semantic: str | None = None
+    final_tier: str | None = None
 
     ack_task = asyncio.create_task(_acknowledge_on_input(broker, gate_event))
 
     try:
-        async for output in hive_app.astream(initial_state):
-            for node_name, state_delta in output.items():
+        stream = hive_app.astream(
+            initial_state,
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+        async for output in stream:
+            for node_name, delta in output.items():
+                # LangGraph yields a None delta for a node that wrote no state
+                # (and for its own internal channels). Indexing into it kills the
+                # sprint after the work is already done — the same Optional trap
+                # the nodes themselves guard against with `or {}`.
+                state_delta = delta or {}
+
                 if "editor_error" in state_delta:
                     final_error = state_delta["editor_error"]
                 if "loop_health" in state_delta:
                     final_loop_health = state_delta["loop_health"] or {}
                 if "semantic_verdict" in state_delta:
                     final_semantic = state_delta["semantic_verdict"]
+                if state_delta.get("model_tier"):
+                    tier = state_delta["model_tier"]
+                    if tier != final_tier:
+                        console.print(
+                            f"🧠 [bold magenta]tier[/] {final_tier or '—'} → "
+                            f"[bold]{tier}[/] ([dim]{llm_factory.model_for(tier)}[/])"
+                        )
+                    final_tier = tier
                 metrics.record_node(node_name)
                 console.print(f"🔄 [bold cyan]{node_name}[/] executed.")
     finally:
@@ -171,6 +204,7 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
         f"llm_cache={metrics.llm_cache_size}  "
         f"attempts={final_loop_health.get('attempt_count', 0)}  "
         f"escalated={escalated}  "
+        f"tier={final_tier or '—'}  "
         f"semantic={final_semantic or '—'}[/]"
     )
 

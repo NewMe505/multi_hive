@@ -57,6 +57,21 @@ def reviewer_logic(state: HiveState) -> str:
     if state.get("editor_error"):
         if state.get("editor_retries", 0) >= MAX_RETRIES:
             return "human_gate_node"
+
+        # You cannot retry a task that does not exist.
+        #
+        # Routing an error back to the editor with no current_task was an
+        # unkillable loop: the editor's first line is `if not current_task:
+        # return {}`, so it no-ops. The reviewers then no-op too (there is no
+        # code to check), which means NOTHING bumps editor_retries — so the
+        # MAX_RETRIES cap above is never reached, and nothing is even logged.
+        #
+        # It is reachable in practice: ticket_writer sets editor_error when the
+        # model returns unparseable JSON, and at that point no task queue exists
+        # yet. Observed live as 10,007 graph steps and an empty rejection ledger.
+        if not state.get("current_task"):
+            return "human_gate_node"
+
         return "async_editor_node"
 
     if state.get("current_task"):

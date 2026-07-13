@@ -53,18 +53,36 @@ class HiveState(TypedDict):
 
     Error propagation contract (enforced by convention)
     ---------------------------------------------------
-    - async_editor_node / reviewer_node: set editor_error on failure and bump
-      editor_retries; clear both on success.
+    - async_editor_node: sets editor_error on a generation failure. Never
+      retires a task.
+    - reviewer_node: sets editor_error and bumps editor_retries when the code
+      fails to run; clears editor_error when it runs. Does NOT retire the task.
+    - semantic_reviewer_node: the last gate, and therefore the ONLY node that
+      retires a task. On PASS it clears editor_error, resets editor_retries,
+      and pulls the next task off the queue. On FAIL it injects the verdict as
+      editor_error and bumps editor_retries, so the rejection routes through
+      the existing retry loop.
     - agent_router_node: never touches editor_error; always resets
-      editor_retries to 0 (it only runs at the start of a new task).
+      editor_retries and loop_health (it only runs at the start of a new task).
     - ticket_writer: may set editor_error once for a JSON-parse failure,
       before any task queue exists.
-    - semantic_reviewer_node: injects its FAIL verdict as editor_error so the
-      rejection routes through the existing retry loop.
     - human_gate_node: clears editor_error and current_task so reviewer_logic
       routes to retrospector after escalation.
     - retrospector_node: deliberately leaves editor_error and editor_retries
       untouched, so the final values stay readable in the end-of-sprint panel.
+
+    Why only the last gate may retire a task
+    ----------------------------------------
+    reviewer_node used to retire the task itself, the moment the code executed:
+    it popped the queue, cleared current_task, and reset editor_retries. But
+    semantic_reviewer_node runs after it. So a semantic rejection landed on a
+    task that was already "finished" — current_task was None, so the editor
+    regenerated nothing, and editor_retries had just been zeroed, so the retry
+    cap was unreachable. The sprint re-validated identical code forever: 992
+    identical rejections and zero escalations, in a real run.
+
+    A task is done when BOTH reviewers pass, and only the last one to run knows
+    that. Do not move advancement earlier.
 
     human_gate_event
     ----------------
@@ -88,5 +106,16 @@ class HiveState(TypedDict):
     # "PASS", "FAIL: <reason>", or None (not yet evaluated).
     # Reset to None by agent_router_node at the start of each new task.
     semantic_verdict: str | None
+    # "trivial" | "moderate" | "hard" — a cheap text-only prior on difficulty,
+    # set by agent_router_node. Seeds the initial model tier.
+    task_complexity: str | None
+    # "fast" | "strong" — which model tier this task is running on.
+    #
+    # Sticky for the duration of a task, and it only ever ratchets upward:
+    # agent_router_node seeds it, async_editor_node may escalate it on failure,
+    # and semantic_reviewer_node follows whatever the editor used. The two
+    # models do not fit in VRAM together, so a tier that could flip back and
+    # forth mid-task would thrash the GPU. See core/model_router.py.
+    model_tier: str | None
     # asyncio.Event — injected per sprint, not checkpointed.
     human_gate_event: Any | None

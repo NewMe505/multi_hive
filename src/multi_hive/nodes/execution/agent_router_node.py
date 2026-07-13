@@ -1,9 +1,10 @@
-"""agent_router_node — injects domain rules and resets per-task state."""
+"""agent_router_node — injects domain rules, picks the model tier, resets state."""
 from __future__ import annotations
 
 import re
 from typing import Any
 
+from multi_hive.core.model_router import classify_complexity, select_tier
 from multi_hive.state import default_loop_health
 
 SPECIALIST_RULES: dict[tuple[str, ...], str] = {
@@ -30,6 +31,12 @@ def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
             if _UI_KEYWORDS.intersection(keywords):
                 is_ui_task = True
 
+    # A fresh task starts on the fast model unless it looks hard up front —
+    # retries are what escalate it, and this node only ever runs at the start
+    # of a task, so retries are 0 by definition here.
+    complexity = classify_complexity(state.get("current_task"))
+    tier = select_tier(complexity, editor_retries=0, repeat_error=False)
+
     # loop_health resets at the start of every task: a repeat_error_hash left
     # over from the previous task would otherwise trip an escalation on the
     # first retry of an unrelated one.
@@ -39,4 +46,6 @@ def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
         "editor_retries": 0,
         "loop_health": default_loop_health(),
         "semantic_verdict": None,
+        "task_complexity": complexity,
+        "model_tier": tier,
     }
