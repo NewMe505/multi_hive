@@ -149,10 +149,22 @@ def main() -> None:
 
     git("add", "pyproject.toml", "CHANGELOG.md")
     git("commit", "-m", f"chore(release): v{new}")
-    git("tag", "-a", f"v{new}", "-m", f"v{new}")
 
-    print(f"\nrelease: {old_str} -> {new}")
-    print(f"release: committed and tagged v{new}")
+    # The post-commit hook tags any commit that changes the version, so by the
+    # time we get here the tag usually already exists — the hook fires during
+    # the commit above. Tagging again is a hard error, so check.
+    #
+    # Both paths are wanted: the hook covers a version bumped by hand, and this
+    # covers a repo whose hooks are not installed (core.hooksPath is per-clone).
+    if git("tag", "--list", f"v{new}"):
+        print(f"\nrelease: {old_str} -> {new}")
+        print(f"release: committed; v{new} tagged by the post-commit hook")
+    else:
+        git("tag", "-a", f"v{new}", "-m", f"v{new}")
+        print(f"\nrelease: {old_str} -> {new}")
+        print(f"release: committed and tagged v{new}")
+
+    print("release: refresh the installed metadata with  pip install -e '.[dev]'")
     print("release: push with  git push && git push --tags")
 
 

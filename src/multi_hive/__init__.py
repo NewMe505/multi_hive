@@ -6,15 +6,44 @@ Nothing heavy is imported here on purpose. `import multi_hive` must stay cheap
 enough for tooling (and tests) to touch it without pulling in langgraph,
 langchain, or rich.
 
-The version is read from installed package metadata rather than hardcoded, so
-pyproject.toml is the single source of truth. Declaring it in both places is
-how the two drift apart.
+pyproject.toml is the single source of the version — never hardcode it here.
 """
-from importlib.metadata import PackageNotFoundError, version
+from __future__ import annotations
 
-try:
-    __version__ = version("multi-hive")
-except PackageNotFoundError:  # running from a source tree, not installed
-    __version__ = "0.0.0+unknown"
+import re
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _resolve_version() -> str:
+    """
+    In a source checkout, read pyproject.toml directly.
+
+    An editable install writes its metadata once, at install time. Bumping the
+    version in pyproject.toml does not refresh it, so importlib.metadata reports
+    the version the tree had when it was last installed — the app printed 4.2.0
+    in its own banner immediately after being released as 4.3.0. When the
+    pyproject that governs this source tree is right there next to it, it is the
+    truth; metadata is the fallback for a real (non-editable) install, where
+    there is no pyproject to read.
+    """
+    try:
+        if _PYPROJECT.is_file():
+            match = _VERSION_RE.search(_PYPROJECT.read_text(encoding="utf-8"))
+            if match:
+                return match.group(1)
+    except OSError:
+        pass
+
+    try:
+        return version("multi-hive")
+    except PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
+__version__ = _resolve_version()
 
 __all__ = ["__version__"]
