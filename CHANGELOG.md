@@ -11,6 +11,8 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+## [4.6.0] - 2026-07-13
+
 ### Added
 
 - **Human-supplied acceptance contracts.** The fix for the self-authored assert
