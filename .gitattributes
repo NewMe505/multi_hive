@@ -1,0 +1,4 @@
+# This project runs on Windows and Linux. Normalise to LF in the repository and
+# in the working tree on both, so a file authored on one platform doesn't show
+# up as an all-lines-changed diff on the other.
+* text=auto eol=lf
