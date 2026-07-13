@@ -150,6 +150,7 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
         "model_tier": None,
         "contracts": {normalise_target(target): contract} if contract else {},
         "contract_satisfied": None,
+        "sprint_started_at": time.monotonic(),
         "human_gate_event": None,  # headless: the gate must not wait for a human
     }
 

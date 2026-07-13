@@ -32,6 +32,17 @@ that spends its first ~50ms loading its own runtime, long before any generated
 code executes. It is a real gap, and it is a small one.
 
 The subprocess timeout bounds runtime on both platforms regardless.
+
+What this does NOT do: confine the filesystem
+---------------------------------------------
+None of these ceilings restrict *where* the child writes. There is no chroot,
+mount namespace, seccomp filter, or AppContainer anywhere here — only RLIMITs (on
+POSIX) or a Job Object (on Windows), which bound memory, process count, and
+per-file size, not filesystem paths. The reviewer runs the child with its cwd
+inside the workspace, but cwd only changes relative-path resolution; generated
+code that opens an absolute path outside the workspace is not stopped. This is a
+resource sandbox, not a filesystem jail — treat the models it runs as
+semi-trusted. See reviewer_node for the same caveat at the point of execution.
 """
 from __future__ import annotations
 

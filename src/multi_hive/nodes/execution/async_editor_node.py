@@ -70,8 +70,13 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         attempts = loop_health.get("attempt_count", 0)
 
         if previous_hash is not None and previous_hash == incoming_hash and attempts >= 1:
+            # Logged under "escalation", not "async_editor_node": this is a routing
+            # decision, not a code-generation failure. get_recent_rejections(
+            # "async_editor_node") feeds the editor's "PAST GENERATION FAILURES —
+            # fix the code structure" section, and telling the model to "fix the
+            # code structure" of a router log line is a category error.
             log_rejection(
-                "async_editor_node",
+                "escalation",
                 f"REPEAT ERROR DETECTED (hash={incoming_hash}, attempts={attempts}) "
                 f"— escalating without retry. Error: {editor_error[:300]}",
             )
@@ -102,14 +107,24 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     tier = select_tier(
         complexity,
         editor_retries=state.get("editor_retries", 0),
-        repeat_error=loop_health.get("repeat_error_hash") is not None and bool(editor_error),
+        # NOT repeat_error. A genuine same-error-twice repeat has already returned
+        # to the human gate in the block above. By the time control reaches here,
+        # repeat_error_hash only means "an error occurred", which is true on the
+        # FIRST retry of every failed task — passing that as repeat_error forced
+        # STRONG on retry 1 and silently disabled ESCALATE_AFTER_FAILURES > 1.
+        # editor_retries >= ESCALATE_AFTER_FAILURES owns escalation from here.
+        repeat_error=False,
     )
     if previous_tier == STRONG:
         tier = STRONG
 
     if tier != previous_tier:
+        # "escalation", not "async_editor_node": a tier change is a routing event,
+        # not a generation failure. Logging it under the editor's node name fed it
+        # straight back into the editor's "fix the code structure" feed on the next
+        # retry — see the REPEAT ERROR note above.
         log_rejection(
-            "async_editor_node",
+            "escalation",
             f"TIER ESCALATION: {previous_tier or 'fast'} -> {tier} "
             f"({model_for(tier)}) after {state.get('editor_retries', 0)} failed "
             f"attempt(s) on a task classified {complexity!r}.",
@@ -174,7 +189,29 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         response = await llm.ainvoke(
             [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
         )
-        project_files[active_file] = _extract_clean_code(response.content)
+        extracted = _extract_clean_code(response.content)
+
+        if not extracted:
+            # An empty extraction is a generation failure, not a success. Taking
+            # the success path here writes "" to the file; reviewer_node then hits
+            # `if not current_code: return {}` — no error, no editor_retries bump,
+            # nothing logged — and agent_router_node resets the counters every
+            # pass, so MAX_RETRIES and the repeat-error breaker can never accrue.
+            # The sprint loops to RECURSION_LIMIT and dies FATAL without ever
+            # reaching the human gate. Route it through the normal failure ladder.
+            msg = "GENERATION PRODUCED NO CODE — the response was empty or an empty code fence."
+            log_rejection("async_editor_node", msg)
+            return {
+                "editor_error": msg,
+                "editor_retries": state.get("editor_retries", 0) + 1,
+                "loop_health": loop_health,
+                "model_tier": tier,
+                "task_complexity": complexity,
+                "messages": state.get("messages", [])
+                + [AIMessage(content=f"[{active_file}] editor produced no code.")],
+            }
+
+        project_files[active_file] = extracted
 
         # The fingerprint is deliberately NOT cleared here.
         #

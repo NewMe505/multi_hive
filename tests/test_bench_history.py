@@ -102,3 +102,31 @@ class TestBaselineSelection:
 
     def test_no_baseline_on_the_very_first_run(self):
         assert history.baseline_for(_run("hive", {"a": True}, wall=100, ts=1)) is None
+
+    def test_a_strict_aggregate_is_never_baselined_against_a_single_run(self):
+        # The false alarm the audit's compare() note was about: a --repeat 3
+        # aggregate scores a task passed only if it passed all three runs, while a
+        # single run is a lucky sample. Comparing them turns a real 1/4 into a
+        # "regression" from a fluke 3/4. Only like is compared with like.
+        single = _run("hive", {"a": True}, wall=100, ts=1)
+        single.repeat = 1
+        history.record(single)
+
+        aggregate = _run("hive", {"a": True}, wall=100, ts=2)
+        aggregate.repeat = 3
+
+        assert history.baseline_for(aggregate) is None, (
+            "a strict x3 aggregate was baselined against a single-run sample"
+        )
+
+    def test_aggregates_baseline_against_prior_aggregates_of_the_same_repeat(self):
+        for ts in (1, 2):
+            run = _run("hive", {"a": True}, wall=100, ts=ts)
+            run.repeat = 3
+            history.record(run)
+
+        current = _run("hive", {"a": True}, wall=100, ts=3)
+        current.repeat = 3
+
+        baseline = history.baseline_for(current)
+        assert baseline is not None and baseline.commit == "c2"

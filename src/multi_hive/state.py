@@ -137,5 +137,13 @@ class HiveState(TypedDict):
     #
     # semantic_reviewer_node reads this and stands down when it is True.
     contract_satisfied: bool | None
+    # time.monotonic() captured by the entrypoint at sprint start, so
+    # retrospector_node can report THIS sprint's wall time in LOOP.md. It used to
+    # read the newest wall_time_sec from metrics.jsonl, but that entry is written
+    # by cli.py *after* the graph drains — i.e. after retrospector has already run
+    # — so LOOP.md always showed the previous sprint's time (0.0 on a fresh
+    # workspace, and 0.0 on every benchmark run, which never writes that entry).
+    # None if the entrypoint did not set it, in which case wall time reports 0.0.
+    sprint_started_at: float | None
     # asyncio.Event — injected per sprint, not checkpointed.
     human_gate_event: Any | None

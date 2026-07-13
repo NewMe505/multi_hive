@@ -22,6 +22,17 @@ compare() flags two kinds, and treats them very differently:
             thermal throttling, another model resident in VRAM, the OS deciding
             to index something. A 5% wobble is weather. The default 25% gate
             fires on real changes without crying about the weather.
+
+Only compare like with like
+---------------------------
+A run's `repeat` count is part of its identity, and baseline_for() only matches
+runs with the same repeat. A `--repeat 3` aggregate scores a task as passed only
+if it passed all three runs (strict); a `--repeat 1` run scores a single sample,
+which on this noisy suite is often luck. Comparing the strict aggregate against a
+lucky single run manufactures a "regression" out of thin air — a real 1/4 gets
+flagged as having fallen from a fluke 3/4. So an x3 aggregate is only ever
+compared against a prior x3 aggregate. Use --repeat >= 3 for anything you intend
+to trust as a baseline.
 """
 from __future__ import annotations
 
@@ -65,6 +76,11 @@ class Run:
     dirty: bool = False
     version: str = ""
     timestamp: float = 0.0
+    # How many times the suite was run to produce this record. Part of the run's
+    # identity: an x3 aggregate (passed = passed every run) and a single sample
+    # are not the same measurement, and baseline_for() refuses to compare across
+    # them. See the module docstring.
+    repeat: int = 1
 
     def stamp(self) -> Run:
         from multi_hive import __version__
@@ -102,6 +118,7 @@ class Run:
             "passed": self.passed,
             "total": self.total,
             "wall_sec": round(self.wall, 1),
+            "repeat": self.repeat,
             "tasks": self.tasks,
         }
 
@@ -117,6 +134,8 @@ class Run:
         run.dirty = raw.get("dirty", False)
         run.version = raw.get("version", "?")
         run.timestamp = raw.get("timestamp", 0.0)
+        # Runs recorded before repeat existed were all single-run (repeat=1).
+        run.repeat = raw.get("repeat", 1)
         return run
 
 
@@ -149,15 +168,24 @@ def load(suite: str | None = None, subject: str | None = None) -> list[Run]:
 
 def baseline_for(run: Run) -> Run | None:
     """
-    The most recent clean run of the same suite and subject, before this one.
+    The most recent clean run of the same suite, subject, AND repeat count,
+    before this one.
 
     Dirty runs are skipped: a benchmark of uncommitted code cannot be reproduced,
     so it is worthless as a point of comparison even though it is worth recording.
+
+    Matching on repeat is what stops a strict x3 aggregate from being compared
+    against a lucky single run — a real 1/4 flagged as a regression from a fluke
+    3/4. The two are different measurements; only like is compared with like. See
+    the module docstring.
     """
     candidates = [
         r
         for r in load(run.suite, run.subject)
-        if not r.dirty and r.timestamp < run.timestamp and r.total
+        if not r.dirty
+        and r.timestamp < run.timestamp
+        and r.total
+        and r.repeat == run.repeat
     ]
     return candidates[-1] if candidates else None
 

@@ -22,12 +22,15 @@ They never want it at the same time — during a sprint the REPL is idle, and
 between sprints the gate cannot fire — so a single reader thread pumps lines
 into a queue and whoever is waiting consumes them.
 
-This replaces a per-sprint listener task that called sys.stdin.readline() in
-an executor. Cancelling that task did not unblock the thread it left sitting
-in readline(), so the threads accumulated: after two sprints the bounded
-2-worker pool was exhausted and the REPL could no longer read input at all.
-A blocking read in a thread cannot be cancelled — so it must never be started
-more than once.
+One daemon thread, started once, pumps lines into an asyncio.Queue. It is a
+daemon thread and not a ThreadPoolExecutor worker for a specific reason: a
+blocking readline() cannot be cancelled, so the reader is always parked inside
+one. concurrent.futures registers an atexit handler that JOINS every live
+non-daemon worker, so a clean `exit`/`quit` hung the interpreter inside that
+join until the user pressed Enter one more time to release the parked read. A
+daemon thread is reaped at interpreter exit instead of pinning it open. It is
+started once and never restarted — an earlier per-sprint listener leaked a
+parked thread per sprint until the pool was exhausted and the REPL went deaf.
 """
 from __future__ import annotations
 
@@ -35,7 +38,8 @@ import argparse
 import asyncio
 import contextlib
 import sys
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
@@ -56,10 +60,6 @@ from multi_hive.core.metrics import SprintMetrics
 from multi_hive.orchestrator import hive_app
 from multi_hive.state import HiveState, default_loop_health
 
-# One thread for the stdin pump, one spare. Unbounded pools queue behind the
-# CPU-saturating Ollama inference threads on a machine running the model locally.
-_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hive-io")
-
 _EOF = object()
 
 
@@ -68,20 +68,26 @@ class StdinBroker:
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue = asyncio.Queue()
-        self._pump_task: asyncio.Task | None = None
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def start(self) -> None:
-        if self._pump_task is None:
-            self._pump_task = asyncio.create_task(self._pump())
+        if self._thread is not None:
+            return
+        self._loop = asyncio.get_running_loop()
+        self._thread = threading.Thread(target=self._pump, name="hive-stdin", daemon=True)
+        self._thread.start()
 
-    async def _pump(self) -> None:
-        loop = asyncio.get_running_loop()
+    def _pump(self) -> None:
+        # Runs in the daemon thread. asyncio.Queue is not thread-safe, so items
+        # are handed to the loop thread via call_soon_threadsafe rather than put
+        # on the queue directly.
         while True:
-            line = await loop.run_in_executor(_executor, sys.stdin.readline)
-            if line == "":  # EOF — Ctrl-D, or a closed pipe.
-                await self._queue.put(_EOF)
+            line = sys.stdin.readline()
+            item = _EOF if line == "" else line.rstrip("\n")  # "" is EOF (Ctrl-D/pipe)
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
+            if item is _EOF:
                 return
-            await self._queue.put(line.rstrip("\n"))
 
     async def readline(self) -> str | None:
         """Next line, or None at EOF."""
@@ -91,15 +97,15 @@ class StdinBroker:
             # acknowledgement task — and whichever reaches the marker first would
             # otherwise swallow it, leaving the other blocked on a queue that no
             # producer will ever fill again. Putting it back makes EOF idempotent.
-            await self._queue.put(_EOF)
+            self._queue.put_nowait(_EOF)
             return None
         return item
 
     async def close(self) -> None:
-        if self._pump_task is not None:
-            self._pump_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._pump_task
+        # Nothing to join: the pump is a daemon thread. If it is parked in a
+        # blocking readline() it is reaped at interpreter exit — it cannot hold
+        # the process open, and a blocking read could not be cancelled anyway.
+        pass
 
 
 async def _acknowledge_on_input(broker: StdinBroker, gate_event: asyncio.Event) -> None:
@@ -175,6 +181,7 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
         "model_tier": None,
         "contracts": contracts,
         "contract_satisfied": None,
+        "sprint_started_at": time.monotonic(),
         "human_gate_event": gate_event,
     }
 
@@ -352,7 +359,6 @@ async def main(objective_file: str | None = None) -> None:
                 break
     finally:
         await broker.close()
-        _executor.shutdown(wait=False, cancel_futures=True)
 
 
 def run() -> None:

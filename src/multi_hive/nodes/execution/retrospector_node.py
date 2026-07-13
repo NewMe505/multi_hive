@@ -36,6 +36,14 @@ def retrospector_node(state: dict[str, Any]) -> dict[str, Any]:
     editor_error = state.get("editor_error")
     semantic_verdict = state.get("semantic_verdict")
 
+    # This sprint's wall time, computed from the start stamp the entrypoint put in
+    # state. Not read from metrics.jsonl: that entry is written by cli.py *after*
+    # the graph drains — after this node has already written LOOP.md — so reading
+    # it back here always yielded the PREVIOUS sprint's time (0.0 on a fresh
+    # workspace), and 0.0 on every benchmark run, which never writes that entry.
+    started_at = state.get("sprint_started_at")
+    wall_time_sec = max(0.0, time.monotonic() - started_at) if started_at else 0.0
+
     # ── Verify-and-backfill ───────────────────────────────────────────────────
     for filepath, content in project_files.items():
         try:
@@ -51,7 +59,6 @@ def retrospector_node(state: dict[str, Any]) -> dict[str, Any]:
                 log_rejection("retrospector_node", f"BACKFILL WRITE FAILED '{filepath}': {e}")
 
     # ── Loop health persistence ───────────────────────────────────────────────
-    wall_time_sec = 0.0
     if loop_health:
         try:
             METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +76,6 @@ def retrospector_node(state: dict[str, Any]) -> dict[str, Any]:
                     )
                     + "\n"
                 )
-            wall_time_sec = _latest_wall_time()
         except Exception as e:
             log_rejection("retrospector_node", f"METRICS WRITE FAILED: {e}")
 
@@ -115,19 +121,3 @@ def retrospector_node(state: dict[str, Any]) -> dict[str, Any]:
         "current_task": None,
         "task_queue": [],
     }
-
-
-def _latest_wall_time() -> float:
-    """Wall time from the most recent perf entry in metrics.jsonl, for LOOP.md."""
-    wall_time = 0.0
-    with METRICS_FILE.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "wall_time_sec" in entry:
-                wall_time = entry["wall_time_sec"]
-    return wall_time

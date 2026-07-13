@@ -42,6 +42,64 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
   downgrade a task that has already failed" is good routing wherever the model
   lives.
 
+### Fixed
+
+Findings from a multi-agent adversarial audit of the codebase, most-severe first.
+
+- **The ground-truth verifier trusted a subprocess exit code alone.** Both the
+  acceptance-contract harness (`contract.py`) and the benchmark harness
+  (`bench/suite.py`) wrapped the module import in `except Exception`, which cannot
+  catch `SystemExit`. A module that ran `exit()`/`sys.exit()`/`os._exit()` at
+  import terminated the harness with returncode 0 **before any assert or hidden
+  test ran**, and returncode 0 alone was recorded as a satisfied contract *and* a
+  passed benchmark task — a false green on the number that gates every decision.
+  The import now catches `BaseException`, and a pass is confirmed by a nonce-tagged
+  sentinel line the generated code cannot forge, never by the exit code.
+
+- **`repeat_error` was `True` on the first retry of every failed task**
+  (`async_editor_node`), forcing the strong model one attempt early and silently
+  disabling `HIVE_ESCALATE_AFTER > 1`. The genuine same-error-twice case already
+  escalates in its own early-return block; the flag is now `False` here so
+  `editor_retries >= ESCALATE_AFTER_FAILURES` owns escalation as documented.
+
+- **Typing `exit`/`quit` hung the REPL** until the user pressed Enter again. The
+  stdin pump ran in a non-daemon `ThreadPoolExecutor` whose `atexit` handler joins
+  every live worker — and the worker was always parked in a blocking `readline()`.
+  It is now a daemon thread, reaped at interpreter exit.
+
+- **A sandbox timeout could hang the reviewer.** After `proc.kill()`, the
+  post-kill `communicate()` had no timeout, so a grandchild inheriting the stdout
+  pipe blocked it forever, defeating the advertised hard timeout. The child is now
+  its own session leader (`start_new_session`) so a timeout SIGKILLs the whole
+  process group, and the drain is bounded.
+
+- **Empty generated code looped to the recursion limit.** An empty extraction took
+  the editor's success path, wrote `""`, and slipped past both safety mechanisms;
+  the sprint died `FATAL` at `RECURSION_LIMIT` without escalating. It is now routed
+  through the normal failure ladder (an `editor_error` and a bumped retry count).
+
+- **The sandbox docs claimed write confinement it does not have.** The sandbox
+  bounds memory, process count, and (POSIX) per-file size, and strips the
+  environment — but does **not** restrict *where* code writes. The docs
+  (`reviewer_node`, `core/platform.py`, `docs/ARCHITECTURE.md`) now say so.
+
+- **The editor's "generation failures" feed was contaminated with routing
+  notices.** `TIER ESCALATION` / `REPEAT ERROR` lines were logged under the
+  editor's node name, so `get_recent_rejections("async_editor_node")` fed router
+  logs back to the model as "fix the code structure". They now log under
+  `"escalation"` — still in the ledger for the operator, out of the editor's feed.
+
+- **LOOP.md's wall time was always the previous sprint's (0.0 on a fresh
+  workspace, 0.0 on every benchmark run).** `retrospector_node` read
+  `wall_time_sec` from `metrics.jsonl`, which `cli.py` writes only *after* the
+  graph drains. The sprint start is now threaded through state and the elapsed
+  time computed in the node.
+
+- **`bench.py`'s regression detector compared a strict `--repeat 3` aggregate
+  against a lucky single run,** manufacturing a "quality regression" out of a
+  fluke. `repeat` is now part of a run's identity, and `baseline_for()` only
+  compares runs of the same repeat count.
+
 ## [4.6.0] - 2026-07-13
 
 ### Added

@@ -230,6 +230,9 @@ def _aggregate(results: dict[str, list[dict]], contract: bool, repeat: int) -> h
     story about the weather.
     """
     run = history.Run(suite="sprint", subject=_subject(contract)).stamp()
+    # Part of the run's identity: an x3 aggregate is only ever compared against a
+    # prior x3 aggregate, never a single-run sample. See bench/history.py.
+    run.repeat = repeat
 
     flaky: list[str] = []
     gamed: list[str] = []

@@ -167,3 +167,45 @@ async def test_repeated_semantic_rejection_escalates_instead_of_looping():
         f"ran {cycles} cycles without escalating — "
         f"editor_retries stuck at {state['editor_retries']}"
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_generation_is_a_failure_not_a_silent_success():
+    """
+    A fourth way the loop could run away, from the audit (finding #5).
+
+    _extract_clean_code returns "" when the model emits an empty or empty-fenced
+    response. Taking the success path then wrote "" to the file with
+    editor_error=None; reviewer_node hit `if not current_code: return {}` — no
+    error, no editor_retries bump, nothing logged — and agent_router_node reset
+    the counters every pass. Neither safety mechanism could accrue, so the sprint
+    looped to RECURSION_LIMIT and died FATAL without ever escalating.
+
+    An empty extraction must route through the normal failure ladder: an
+    editor_error, and a bumped editor_retries so MAX_RETRIES stays reachable.
+    """
+    from multi_hive.nodes.execution import async_editor_node as mod
+
+    state = {
+        "current_task": "Implement add(a, b)",
+        "active_file": "outputs/add.py",
+        "project_files": {},
+        "editor_error": None,
+        "editor_retries": 0,
+        "loop_health": default_loop_health(),
+        "messages": [],
+        "contracts": {},
+    }
+
+    with patch.object(mod, "get_async_llm") as get_llm:
+        # Whitespace-only content → empty extraction → the old silent-success path.
+        get_llm.return_value.ainvoke = AsyncMock(
+            return_value=type("R", (), {"content": "   "})()
+        )
+        delta = await mod.async_editor_node(state)
+
+    assert delta["editor_error"] is not None
+    assert "NO CODE" in delta["editor_error"]
+    assert delta["editor_retries"] == 1
+    # And it must NOT have written an empty file on the success path.
+    assert not delta.get("project_files", {}).get("outputs/add.py")

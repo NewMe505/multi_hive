@@ -179,6 +179,17 @@ def assert_count(body: str) -> int:
 # Exit codes are distinct because the three failures mean different things to the
 # editor: the module did not import (broken code), a name was missing (wrong API),
 # or an assert was false (wrong behaviour).
+#
+# The exit code is NOT the ground truth for a pass — the final sentinel line is.
+# A module that calls sys.exit()/os._exit()/exit() at import time terminates the
+# harness with returncode 0 *before any assert runs*, and returncode 0 alone would
+# read that as a satisfied contract with zero asserts executed. So:
+#   - the import is guarded with `except BaseException`, which (unlike `Exception`)
+#     catches SystemExit, turning a top-level sys.exit() into a clean IMPORT_FAIL;
+#   - the pass is confirmed only by "CONTRACT_PASS <token>", printed on the last
+#     line after every assert survived. The token is a per-run nonce the module
+#     cannot know, so the pass signal cannot be forged even by a module that prints
+#     "CONTRACT_PASS" itself or calls os._exit(0) (which no `except` can catch).
 
 _HARNESS = '''\
 import importlib.util
@@ -189,7 +200,7 @@ __spec_ = importlib.util.spec_from_file_location("candidate", r"@MODULE@")
 __mod_ = importlib.util.module_from_spec(__spec_)
 try:
     __spec_.loader.exec_module(__mod_)
-except Exception:
+except BaseException:
     print("CONTRACT_IMPORT_FAIL")
     traceback.print_exc()
     sys.exit(2)
@@ -212,11 +223,27 @@ except Exception:
     traceback.print_exc()
     sys.exit(5)
 
-print("CONTRACT_PASS")
+print("CONTRACT_PASS @TOKEN@")
 '''
 
 
-def render_harness(module_path: str, body: str) -> str:
-    """The runnable harness script for `body` against the module at `module_path`."""
+def pass_marker(token: str) -> str:
+    """The exact final line a passing harness prints. The consumer checks for this."""
+    return f"CONTRACT_PASS {token}"
+
+
+def render_harness(module_path: str, body: str, token: str) -> str:
+    """
+    The runnable harness script for `body` against the module at `module_path`.
+
+    `token` is a per-run nonce printed on the pass line. The caller confirms a
+    pass by finding pass_marker(token) in the output — never by the exit code
+    alone, which a top-level exit() in the generated code can forge. See the
+    _HARNESS comment.
+    """
     indented = "\n".join("    " + line for line in body.splitlines())
-    return _HARNESS.replace("@MODULE@", str(module_path)).replace("@BODY@", indented)
+    return (
+        _HARNESS.replace("@MODULE@", str(module_path))
+        .replace("@BODY@", indented)
+        .replace("@TOKEN@", token)
+    )

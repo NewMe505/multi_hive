@@ -189,21 +189,39 @@ itself, and a task writing to `src/foo.py` would otherwise land inside
 ## The sandbox
 
 `reviewer_node` executes generated code in a subprocess with a stripped
-environment (no host secrets), a hard timeout, no write access outside the
+environment (no host secrets), a hard timeout, a working directory inside the
 workspace, and enforced resource ceilings. All of that holds on both platforms —
 but the *mechanism* differs, because Windows has no `fork()`:
 
 - **POSIX** — RLIMITs applied in a `preexec_fn`, between `fork()` and `exec()`.
+  The child is also its own session leader (`start_new_session`), so a timeout
+  SIGKILLs the whole process group, not just the direct child — otherwise a
+  grandchild holding the stdout pipe defeats the hard timeout.
 - **Windows** — the child is assigned to a **Job Object** immediately after
   spawn (`core.platform.confine()`), carrying `ProcessMemoryLimit` and
   `ActiveProcessLimit`. The job is `KILL_ON_JOB_CLOSE`, so the handle must
   outlive `communicate()` — closing it early would kill a healthy run.
 
-Memory (2 GB) and process count (64) are enforced on both. Two things are not,
-and are stated rather than faked: Job Objects have no file-size limit, so a
-runaway *write* on Windows is bounded only by disk; and there is a
-sub-millisecond window between spawn and assignment during which the child is
-unconstrained.
+Memory (2 GB) and process count (64) are enforced on both. What is **not**
+enforced is stated rather than faked:
+
+- **Write *location* is not confined.** There is no chroot, mount namespace,
+  seccomp, or AppContainer — the ceilings bound memory, process count, and
+  (POSIX) per-file size, not filesystem paths. `cwd` is set inside the workspace,
+  but that only affects relative-path resolution; code that opens an *absolute*
+  path outside the workspace runs unimpeded. This is a resource sandbox, not a
+  filesystem jail — treat the models it runs as semi-trusted.
+- **File size** is unbounded on Windows (Job Objects have no `RLIMIT_FSIZE`
+  equivalent), so a runaway *write* there is bounded only by disk.
+- **A sub-millisecond window** between spawn and Job-Object assignment on Windows
+  leaves the child briefly unconstrained.
+
+The ground-truth verdict does not trust the exit code alone, either: a module
+that calls `exit(0)`/`os._exit(0)` at import terminates the harness with
+returncode 0 before any assert or hidden test runs. Both the acceptance-contract
+harness (`contract.py`) and the benchmark harness (`bench/suite.py`) confirm a
+pass by a nonce-tagged sentinel line the generated code cannot forge, never by
+the return code.
 
 ### Testing a sandbox honestly
 

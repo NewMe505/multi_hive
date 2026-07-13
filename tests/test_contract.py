@@ -125,13 +125,18 @@ def test_contract_lookup_prefers_an_exact_match_then_falls_back_to_wildcard():
 # ── The harness ───────────────────────────────────────────────────────────────
 
 
+_TEST_TOKEN = "tok_test_sentinel_0001"
+
+
 def _run_contract(module_src: str, contract: str) -> tuple[int, str]:
     with tempfile.TemporaryDirectory() as tmp:
         module = Path(tmp) / "candidate.py"
         module.write_text(module_src, encoding="utf-8")
 
         harness = Path(tmp) / "harness.py"
-        harness.write_text(render_harness(str(module), contract), encoding="utf-8")
+        harness.write_text(
+            render_harness(str(module), contract, _TEST_TOKEN), encoding="utf-8"
+        )
 
         proc = subprocess.run(
             [sys.executable, str(harness)], capture_output=True, text=True, timeout=60
@@ -167,6 +172,26 @@ def test_a_module_that_does_not_import_is_reported_before_any_assert_runs():
 
     assert code == 2
     assert "CONTRACT_IMPORT_FAIL" in out
+
+
+def test_a_top_level_sys_exit_at_import_is_caught_as_an_import_failure():
+    # `except Exception` cannot catch SystemExit. Before the harness caught
+    # BaseException, a module running sys.exit(0) at import exited 0 before any
+    # assert ran — and exit-0 alone was read as a satisfied contract with zero
+    # asserts executed. It must be an import failure instead. (Audit finding #1.)
+    code, out = _run_contract("import sys\nsys.exit(0)\n", "assert True")
+
+    assert code == 2
+    assert "CONTRACT_IMPORT_FAIL" in out
+
+
+def test_a_passing_run_carries_the_per_run_nonce():
+    # The pass is confirmed by "CONTRACT_PASS <token>", not the exit code. The
+    # token is why a module cannot forge a pass by printing the sentinel itself.
+    code, out = _run_contract("def add(a, b):\n    return a + b\n", "assert add(2, 2) == 4")
+
+    assert code == 0
+    assert _TEST_TOKEN in out
 
 
 def test_the_models_own_asserts_do_not_run_under_a_contract():
@@ -221,6 +246,29 @@ def test_reviewer_fails_code_that_violates_the_contract_and_says_whose_fault_it_
     # wrong. Left ambiguous, a 7B model "fixes" the failure by rewriting the test.
     assert "ACCEPTANCE CONTRACT VIOLATED" in result["editor_error"]
     assert "the code is what is wrong" in result["editor_error"]
+
+
+def test_reviewer_rejects_a_module_that_exits_zero_at_import():
+    # os._exit(0) is un-catchable — it exits the process with code 0 before any
+    # assert runs and without printing the sentinel. The reviewer confirms a pass
+    # by the nonce sentinel, never the exit code, so this is a failure, not the
+    # false green the audit flagged as finding #1.
+    result = _review("import os\nos._exit(0)\n", "assert add(2, 2) == 4")
+
+    assert result["contract_satisfied"] is False
+    assert result["editor_retries"] == 1
+    assert "before the contract could run" in result["editor_error"]
+
+
+def test_reviewer_ignores_a_module_that_prints_the_sentinel_itself():
+    # The sentinel carries a per-run nonce the module cannot know, so printing
+    # "CONTRACT_PASS" and exiting cannot forge a satisfied contract.
+    result = _review(
+        "print('CONTRACT_PASS deadbeefdeadbeef')\nimport os\nos._exit(0)\n",
+        "assert add(2, 2) == 4",
+    )
+
+    assert result["contract_satisfied"] is False
 
 
 # ── semantic_reviewer_node ────────────────────────────────────────────────────
@@ -374,3 +422,15 @@ def test_every_bench_task_has_a_contract():
     from multi_hive.bench.suite import TASKS
 
     assert {t.name for t in TASKS} == set(CONTRACTS)
+
+
+def test_grade_does_not_pass_a_module_that_exits_zero_at_import():
+    # The benchmark harness has the same guard as the contract harness. A
+    # candidate that calls os._exit(0) at import terminates with returncode 0
+    # before a single hidden test runs; scored as a pass, that is a false green on
+    # the number that gates every decision. It must be a failure. (Audit #1.)
+    from multi_hive.bench.suite import BY_NAME, grade
+
+    result = grade("import os\nos._exit(0)\n", BY_NAME["lru_cache"])
+
+    assert result.passed is False
