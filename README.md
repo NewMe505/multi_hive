@@ -117,19 +117,32 @@ Every tuneable is an environment variable — see `config.py`.
   Enter, then continues anyway after `HIVE_GATE_TIMEOUT`. A headless run
   terminates cleanly instead of hanging forever.
 
-## Sandbox: known platform gap
+## The sandbox
 
-Generated code runs in a subprocess with a stripped environment, a hard
-timeout, and no write access outside the workspace — on both platforms.
+Generated code is untrusted and it is *executed*. It runs in a subprocess with a
+stripped environment (no host secrets), a hard timeout, no write access outside
+the workspace, and enforced resource ceilings — on **both** platforms.
 
-On **Linux**, it additionally gets RLIMIT ceilings on address space (2 GB),
-file size (10 MB), and process count (64), applied via `preexec_fn`.
+Each OS enforces through the only mechanism it has. POSIX applies RLIMITs in a
+`preexec_fn` between `fork()` and `exec()`. Windows has no `fork()`, so the
+child is assigned to a **Job Object** immediately after spawn.
 
-On **Windows** those ceilings are **not** applied. `preexec_fn` requires
-`fork()`, which Windows does not have; enforcing the equivalent needs a Job
-Object through `ctypes`. This is stated plainly rather than faked — if you
-intend to run genuinely untrusted code on Windows, that gap is worth closing
-first. See `core/platform.py`.
+| ceiling | POSIX | Windows |
+|---|---|---|
+| memory | 2 GB (`RLIMIT_AS`) | 2 GB (`ProcessMemoryLimit`) |
+| process count | 64 (`RLIMIT_NPROC`) | 64 (`ActiveProcessLimit`) |
+| file size | 10 MB (`RLIMIT_FSIZE`) | **not enforced** — Job Objects have no equivalent |
+| wall clock | `HIVE_SANDBOX_TIMEOUT` | `HIVE_SANDBOX_TIMEOUT` |
+
+Two residual Windows caveats, stated rather than papered over: a runaway *write*
+is bounded only by disk, and there is a sub-millisecond window between spawn and
+job assignment during which the child is unconstrained (closing it needs
+`CREATE_SUSPENDED` on a thread handle `subprocess.Popen` does not expose; in
+practice the child spends its first ~50 ms loading CPython).
+
+`tests/test_sandbox_limits.py` proves enforcement by running a 3 GB memory bomb —
+sized to *survive* unconfined and *die* confined, so the test cannot pass by
+accident on a machine that was merely out of RAM.
 
 ## Tests
 

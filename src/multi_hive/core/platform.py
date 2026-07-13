@@ -1,27 +1,44 @@
 """
 platform.py — the Windows/Linux compatibility seam.
 
-The hive was written against Linux and reached for the stdlib `resource`
-module in two places: peak-RSS sampling (metrics) and RLIMIT ceilings on the
-reviewer sandbox (reviewer_node). `resource` does not exist on Windows, so
-importing either module there was an immediate ImportError.
+The hive was written against Linux and reached for the stdlib `resource` module
+in two places: peak-RSS sampling (metrics) and resource ceilings on the reviewer
+sandbox. `resource` does not exist on Windows, so importing either module there
+was an immediate ImportError.
 
-Everything platform-specific now lives behind these two functions.
+Sandboxing generated code, on both platforms
+--------------------------------------------
+Generated code is untrusted, and it is *executed*. Each platform enforces the
+ceilings through the only mechanism it has:
 
-Known asymmetry, deliberately not hidden
-----------------------------------------
-sandbox_preexec() returns None on Windows. preexec_fn requires fork(), which
-Windows does not have, so the address-space / file-size / process-count caps
-on generated code are NOT enforced there. Matching them would mean a Job
-Object via ctypes — worth doing if untrusted code ever runs on Windows, but
-it is a real feature, not a shim, so it is not silently faked here.
-Generated code is still bounded by the subprocess timeout on both platforms.
+  POSIX     RLIMITs applied in a preexec_fn between fork() and exec().
+  Windows   A Job Object the child is assigned to immediately after spawn.
+            Windows has no fork(), so preexec_fn does not exist there.
+
+The two are not identical, and the differences are stated rather than papered
+over:
+
+  address space / memory   both      2 GB   (RLIMIT_AS   / ProcessMemoryLimit)
+  process count            both      64     (RLIMIT_NPROC / ActiveProcessLimit)
+  file size                POSIX only 10 MB (RLIMIT_FSIZE; Job Objects have no
+                                             equivalent — a runaway write on
+                                             Windows is bounded only by disk)
+
+On Windows there is also a sub-millisecond window between CreateProcess and
+AssignProcessToJobObject during which the child is unconstrained. Closing it
+properly needs CREATE_SUSPENDED plus a ResumeThread on a handle that
+subprocess.Popen does not expose. In practice the child is a fresh python.exe
+that spends its first ~50ms loading its own runtime, long before any generated
+code executes. It is a real gap, and it is a small one.
+
+The subprocess timeout bounds runtime on both platforms regardless.
 """
 from __future__ import annotations
 
 import os
 import sys
 from collections.abc import Callable
+from typing import Any
 
 IS_WINDOWS = os.name == "nt"
 
@@ -29,6 +46,12 @@ try:  # POSIX only
     import resource  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - exercised on Windows
     resource = None  # type: ignore[assignment]
+
+# Ceilings applied to generated code. 2 GB is large enough for OpenBLAS/SciPy to
+# initialise, which the DSP tasks need.
+_MEMORY_LIMIT_BYTES = 2 * 1024**3
+_FILE_SIZE_LIMIT_BYTES = 10 * 1024**2
+_PROCESS_LIMIT = 64
 
 
 def peak_rss_mb() -> float:
@@ -107,22 +130,148 @@ def _windows_peak_rss_mb() -> float:
 
 def sandbox_preexec() -> Callable[[], None] | None:
     """
-    SEC-H3: hard resource ceilings for the reviewer sandbox subprocess.
+    POSIX half of the sandbox: RLIMITs applied between fork() and exec().
 
-    Returns a preexec_fn on POSIX, or None on Windows (see module docstring).
-    Pass the result straight to subprocess.Popen(preexec_fn=...).
+    Returns a preexec_fn to hand straight to subprocess.Popen(preexec_fn=...),
+    or None on Windows, where fork() does not exist. On Windows the ceilings are
+    applied after the spawn instead — see confine().
     """
     if resource is None or IS_WINDOWS:
         return None
 
     def _apply_limits() -> None:
         try:
-            # 2 GB address space — enough for OpenBLAS/SciPy to initialise.
-            resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024**2, 10 * 1024**2))
+            resource.setrlimit(
+                resource.RLIMIT_AS, (_MEMORY_LIMIT_BYTES, _MEMORY_LIMIT_BYTES)
+            )
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE, (_FILE_SIZE_LIMIT_BYTES, _FILE_SIZE_LIMIT_BYTES)
+            )
             if hasattr(resource, "RLIMIT_NPROC"):
-                resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+                resource.setrlimit(resource.RLIMIT_NPROC, (_PROCESS_LIMIT, _PROCESS_LIMIT))
         except (ValueError, OSError):
             pass
 
     return _apply_limits
+
+
+def confine(pid: int) -> Any | None:
+    """
+    Windows half of the sandbox: assign a freshly-spawned child to a Job Object
+    carrying the memory and process-count ceilings.
+
+    Call immediately after subprocess.Popen. Returns an opaque handle that the
+    caller MUST keep alive for the lifetime of the process and then pass to
+    release() — the job is created with KILL_ON_JOB_CLOSE, so dropping the last
+    reference to it terminates the child. That is the desired behaviour (no
+    orphaned runaway code), but it means an early garbage collection would kill
+    a healthy sandbox run.
+
+    A no-op returning None on POSIX, where sandbox_preexec() already did the job
+    before exec().
+    """
+    if not IS_WINDOWS:
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = (
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        info.BasicLimitInformation.ActiveProcessLimit = _PROCESS_LIMIT
+        info.ProcessMemoryLimit = _MEMORY_LIMIT_BYTES
+
+        if not k32.SetInformationJobObject(
+            job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            k32.CloseHandle(job)
+            return None
+
+        handle = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not handle:
+            k32.CloseHandle(job)
+            return None
+
+        assigned = k32.AssignProcessToJobObject(job, handle)
+        k32.CloseHandle(handle)
+
+        if not assigned:
+            k32.CloseHandle(job)
+            return None
+
+        return job
+    except Exception:
+        # A sandbox we could not build is worth reporting, never worth crashing
+        # the sprint over. The subprocess timeout still bounds the child.
+        return None
+
+
+def release(job: Any | None) -> None:
+    """Close a Job Object handle from confine(). Safe to call with None."""
+    if job is None or not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
+    except Exception:
+        pass

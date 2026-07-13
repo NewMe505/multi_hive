@@ -110,41 +110,85 @@ Generated code lives in `./workspace`, never in `./src` — `src/` is the packag
 itself, and a task writing to `src/foo.py` would otherwise land inside
 `multi_hive`'s own source.
 
-## The sandbox, and its one honest gap
+## The sandbox
 
 `reviewer_node` executes generated code in a subprocess with a stripped
-environment (no host secrets), a hard timeout, and no write access outside the
-workspace. That holds on both platforms.
+environment (no host secrets), a hard timeout, no write access outside the
+workspace, and enforced resource ceilings. All of that holds on both platforms —
+but the *mechanism* differs, because Windows has no `fork()`:
 
-On **Linux** it additionally applies RLIMIT ceilings — 2 GB address space, 10 MB
-file size, 64 processes — via `preexec_fn`.
+- **POSIX** — RLIMITs applied in a `preexec_fn`, between `fork()` and `exec()`.
+- **Windows** — the child is assigned to a **Job Object** immediately after
+  spawn (`core.platform.confine()`), carrying `ProcessMemoryLimit` and
+  `ActiveProcessLimit`. The job is `KILL_ON_JOB_CLOSE`, so the handle must
+  outlive `communicate()` — closing it early would kill a healthy run.
 
-On **Windows** those ceilings are **not applied**. `preexec_fn` requires
-`fork()`, which Windows does not have; the equivalent needs a Job Object through
-`ctypes`. This is documented rather than faked. If genuinely untrusted code will
-run on Windows, close that gap first. See `core/platform.py`.
+Memory (2 GB) and process count (64) are enforced on both. Two things are not,
+and are stated rather than faked: Job Objects have no file-size limit, so a
+runaway *write* on Windows is bounded only by disk; and there is a
+sub-millisecond window between spawn and assignment during which the child is
+unconstrained.
 
-## Model tiering (planned)
+### Testing a sandbox honestly
 
-The system currently uses one model for everything, selected by *purpose*
-(`planner`, `ticket`, `editor`, `reviewer`) in `core/llm_factory.py`, with each
-purpose getting its own sampling parameters and context window.
+`tests/test_sandbox_limits.py` is worth reading as a cautionary tale. Its first
+version ran a 12.8 GB memory bomb and asserted the child died. It passed — while
+the sandbox was enforcing **nothing at all**. The child had died because Ollama
+was holding 18 GB and the machine genuinely ran out of RAM. A green test that
+measured the weather.
 
-The intended evolution is to select by **difficulty** as well as purpose:
+The bomb is now 3 GB: over the 2 GB ceiling, far under any real machine's RAM.
+It must *survive* unconfined and *die* confined. The unconfined control runs as
+its own test, so if the machine is ever too small to hold the bomb, the control
+fails loudly instead of letting the confinement test pass for free.
 
-- route a task to a small fast model first, and escalate to a larger one when
-  the loop fails — the retry budget then buys a *better attempt*, not just
-  another attempt from the same model that already failed;
-- and/or have a larger model perform the semantic review, so the reviewer is not
-  the same model (with the same blind spots) that wrote the code.
+## Model tiering
 
-That second point is the sharper one. Same-model adversarial review is the
-weakest part of the current design: a model that does not know it got something
-wrong is not well placed to notice that it got it wrong.
+Models are selected by *purpose* (sampling parameters — a planner needs room to
+think, a reviewer emits one deterministic line) **and** by *tier* (which model
+runs it). `core/llm_factory.py` caches clients on the `(purpose, tier)` pair;
+`core/model_router.py` picks the tier.
 
-`scripts/bench_models.py` measures candidate models on this machine — tokens per
-second, GPU/CPU placement, and whether the output survives the hive's own quality
-gates — so the tiers are chosen from measurements rather than from leaderboards.
+Two tiers, chosen by measuring on the target machine — an RTX 5070 Laptop with
+8 GB of VRAM — not from leaderboards:
+
+| model | tok/s | GPU placement | hidden tests | |
+|---|---|---|---|---|
+| qwen2.5-coder:7b | 52.2 | 100% (4.7/4.7 GB) | 2/4 | **fast** |
+| qwen2.5-coder:14b | 11.6 | 61% (6.0/10.0 GB) | — | dropped |
+| qwen3-coder:30b | 34.2 | 32% (6.1/19.2 GB) | 3/4 | **strong** |
+
+The 14B is the *almost fits* trap: 10 GB into 8 GB of VRAM leaves 39% of a
+**dense** model on the CPU, and a dense model touches every parameter for every
+token. Five times slower than the 7B, for no measured gain. Dropped.
+
+The 30B is **faster than the 14B despite being twice the size**, because it is
+mixture-of-experts — roughly 3B parameters active per token. Bigger model, less
+VRAM-bound, faster.
+
+The quality column comes from `scripts/bench_models.py`, which grades against
+hidden test suites the model never sees. Both tiers clear the *moderate* tasks,
+so routing those to the fast model costs nothing. The strong model wins on
+*hard* ones — it implements semver precedence correctly where the 7B silently
+ignores build metadata, which is exactly the confident-but-subtly-wrong failure
+the ladder exists to catch. Neither model passes `word_wrap`; escalation is not
+magic, and that is what the human gate is for.
+
+### Why the tier is sticky per task
+
+The two models cannot both be resident: 4.7 + 6.1 GB against 8 GB of VRAM. Every
+tier switch is an eviction and a reload, and the strong model takes up to ~23s to
+load.
+
+So the tier is chosen once per task and held — editor and semantic reviewer
+alike. The obvious-sounding design, *small model writes, large model reviews
+everything*, would ping-pong the two through VRAM and pay that reload twice on
+every single task, to scrutinise code the fast model probably got right.
+
+Instead the tier ratchets: a task escalates on failure (or starts strong if it
+looks hard), and an escalated task then gets the stronger reviewer **for free**,
+because it is already on that tier. That is precisely the task where the extra
+scrutiny is warranted — the fast model has already failed it once.
 
 ## Module map
 

@@ -11,6 +11,45 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Added
+
+- **The Windows sandbox now enforces its ceilings.** Generated code is untrusted
+  and it is executed; on Windows it previously ran with no memory or process
+  limit at all, because `preexec_fn` requires `fork()`. `core.platform.confine()`
+  now assigns the child to a **Job Object** (`ProcessMemoryLimit` 2 GB,
+  `ActiveProcessLimit` 64, `KILL_ON_JOB_CLOSE`) immediately after spawn. Memory
+  and process count are now capped on both platforms.
+
+  Still not enforced on Windows, and said plainly rather than faked: Job Objects
+  have no file-size limit, so a runaway *write* is bounded only by disk; and
+  there is a sub-millisecond window between spawn and assignment during which the
+  child is unconstrained.
+
+- Hidden-test grading in `scripts/bench_models.py`. The previous gates only
+  checked that code compiled, ran, and contained the right function names — every
+  model scored full marks, which measured nothing. Grading now runs suites the
+  model never sees, probing the edge cases each task implies. It discriminates:
+
+  | task | qwen2.5-coder:7b | qwen3-coder:30b |
+  |---|---|---|
+  | lru_cache (moderate) | ✓ | ✓ |
+  | merge_intervals (moderate) | ✓ | ✓ |
+  | semver (hard) | ✗ ignored build metadata | ✓ |
+  | word_wrap (hard) | ✗ | ✗ no hard-split |
+  | | **2/4** | **3/4** |
+
+  This is the evidence the escalation ladder rested on and previously lacked.
+
+### Fixed
+
+- `release.py` raced its own `post-commit` hook: the hook tags any commit that
+  changes the version and fires *during* the release commit, so the script then
+  tried to create a tag that already existed and died.
+- `__version__` reported a stale version. It read from `importlib.metadata`, but
+  an editable install writes that metadata once — the app printed
+  `v4.2.0` in its banner immediately after being released as `4.3.0`. In a source
+  checkout the adjacent `pyproject.toml` is now the truth.
+
 ## [4.3.0] - 2026-07-12
 
 ### Added

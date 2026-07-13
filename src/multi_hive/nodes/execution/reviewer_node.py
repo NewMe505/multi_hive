@@ -19,7 +19,7 @@ from typing import Any
 
 from multi_hive.config import SANDBOX_TIMEOUT_SEC, WORKSPACE_DIR, sandbox_env
 from multi_hive.core.memory import log_rejection
-from multi_hive.core.platform import sandbox_preexec
+from multi_hive.core.platform import confine, release, sandbox_preexec
 from multi_hive.core.utils import flush_file, safe_path
 
 _MAX_OUTPUT_CHARS = 65536
@@ -86,6 +86,9 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
         return _executes(loop_health)
 
     # ── Sandboxed execution ───────────────────────────────────────────────────
+    # Two halves of one sandbox: preexec_fn applies RLIMITs between fork and exec
+    # on POSIX; confine() assigns the child to a Job Object on Windows, which has
+    # no fork. See core/platform.py for what each actually enforces.
     proc = subprocess.Popen(
         [sys.executable, str(impl_path)],
         stdout=subprocess.PIPE,
@@ -94,6 +97,7 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
         cwd=str(WORKSPACE_DIR),
         preexec_fn=sandbox_preexec(),
     )
+    job = confine(proc.pid)
 
     try:
         out_bytes, _ = proc.communicate(timeout=SANDBOX_TIMEOUT_SEC)
@@ -107,6 +111,10 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
             + f"\nTIMEOUT: Execution exceeded {SANDBOX_TIMEOUT_SEC}s."
         )
         passed = False
+    finally:
+        # The job is KILL_ON_JOB_CLOSE, so this must not run before communicate()
+        # returns — closing it early would kill a perfectly healthy sandbox run.
+        release(job)
 
     if passed:
         return _executes(loop_health)

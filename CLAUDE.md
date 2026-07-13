@@ -31,9 +31,10 @@ Windows path is the one that breaks:
   before the Rich `Console` is constructed. Keep it that way — a stray
   `open()` without an encoding will raise `UnicodeEncodeError` on the first
   traceback containing a non-ASCII byte.
-- `preexec_fn` needs `fork()` and does not exist on Windows, so the sandbox
-  RLIMIT ceilings are POSIX-only. This is a known, documented gap — do not
-  paper over it.
+- `preexec_fn` needs `fork()` and does not exist on Windows. The sandbox
+  therefore has two halves: RLIMITs via `preexec_fn` on POSIX, and a Job Object
+  via `core.platform.confine()` on Windows. The job is `KILL_ON_JOB_CLOSE` — its
+  handle must outlive `communicate()`, or you kill a healthy sandbox run.
 - `os.environ` keys are upper-cased on Windows. `os.environ["SystemRoot"]`
   silently misses; `SYSTEMROOT` is the one that is there.
 
