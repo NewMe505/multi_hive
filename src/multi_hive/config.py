@@ -68,6 +68,18 @@ if os.environ.get("HIVE_MODEL"):
 
 MAX_RETRIES = int(os.environ.get("HIVE_MAX_RETRIES", "3"))
 
+# How many acceptance assertions may be adjudicated away per task.
+#
+# An acceptance assertion can itself be wrong, and a wrong assertion rejects
+# correct code. reviewer_node may therefore drop one — but only after the
+# adjudicator rules that it contradicts the task, never the last remaining
+# assertion, and at most this many times.
+#
+# The bound exists because the failure mode is obvious: without it, a model that
+# cannot satisfy the spec can simply keep deleting the spec until nothing is left
+# to fail.
+SPEC_REPAIR_LIMIT = int(os.environ.get("HIVE_SPEC_REPAIR_LIMIT", "2"))
+
 # Hard ceiling on graph steps per sprint — a backstop, not a working limit.
 #
 # A healthy sprint is a handful of nodes per task. LangGraph's own default is

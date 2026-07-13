@@ -3,13 +3,19 @@ orchestrator.py — the LangGraph graph definition.
 
 Graph shape
 -----------
-sprint_planner → ticket_writer → agent_router_node → async_editor_node
-  → reviewer_node → semantic_reviewer_node → [conditional]
+sprint_planner → ticket_writer → agent_router_node → spec_writer_node
+  → async_editor_node → reviewer_node → semantic_reviewer_node → [conditional]
                                            → async_editor_node   (retry)
                                            → human_gate_node     (escalate)
                                            → agent_router_node   (next task)
                                            → retrospector_node   (done)
   human_gate_node → retrospector_node → END
+
+spec_writer_node sits before the editor on purpose: the acceptance criteria are
+derived from the task, before any implementation exists to rationalise them
+against. The editor used to write its own asserts, and a model grading its own
+homework fails both ways — a wrong assert rejects correct code, a lazy one waves
+a bug through. Both were observed.
 
 The two reviewers verify different things and both must pass before the graph
 advances. reviewer_node verifies *execution*: the code runs and its own
@@ -28,6 +34,7 @@ from multi_hive.nodes.execution.human_gate_node import human_gate_node
 from multi_hive.nodes.execution.retrospector_node import retrospector_node
 from multi_hive.nodes.execution.reviewer_node import reviewer_node
 from multi_hive.nodes.execution.semantic_reviewer_node import semantic_reviewer_node
+from multi_hive.nodes.execution.spec_writer_node import spec_writer_node
 from multi_hive.nodes.execution.sprint_planner import sprint_planner
 from multi_hive.nodes.execution.ticket_writer import ticket_writer
 from multi_hive.state import HiveState
@@ -93,6 +100,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("sprint_planner", sprint_planner)
     workflow.add_node("ticket_writer", ticket_writer)
     workflow.add_node("agent_router_node", agent_router_node)
+    workflow.add_node("spec_writer_node", spec_writer_node)
     workflow.add_node("async_editor_node", async_editor_node)
     workflow.add_node("reviewer_node", reviewer_node)
     workflow.add_node("semantic_reviewer_node", semantic_reviewer_node)
@@ -102,7 +110,10 @@ def build_graph() -> StateGraph:
     workflow.set_entry_point("sprint_planner")
     workflow.add_edge("sprint_planner", "ticket_writer")
     workflow.add_edge("ticket_writer", "agent_router_node")
-    workflow.add_edge("agent_router_node", "async_editor_node")
+    # The spec is written BEFORE the code, from the task — so the implementer
+    # cannot author the criteria it will be judged against.
+    workflow.add_edge("agent_router_node", "spec_writer_node")
+    workflow.add_edge("spec_writer_node", "async_editor_node")
     workflow.add_edge("async_editor_node", "reviewer_node")
     workflow.add_edge("reviewer_node", "semantic_reviewer_node")
     workflow.add_conditional_edges("semantic_reviewer_node", reviewer_logic)

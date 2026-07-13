@@ -34,6 +34,51 @@ sprint_planner → ticket_writer → agent_router_node → async_editor_node
 | `current_task` | `agent_router_node` | advance to the next task |
 | otherwise | `retrospector_node` | sprint complete |
 
+## The model must not grade its own homework
+
+`spec_writer_node` derives the acceptance criteria from the **task**, before any
+code exists. The editor is shown them, must satisfy them, and cannot change them.
+
+This exists because the editor used to write its own asserts, and that fails in
+both directions:
+
+- **A wrong assert rejects correct code.** Observed live: the model asserted
+  `wrap_text("hello world", 10) == ["hello world"]`. That string is eleven
+  characters and the width is ten — it cannot fit, so the assertion was simply
+  false. Its own test rejected its own *correct* implementation, burnt the retry
+  budget, escalated the model tier, and woke a human.
+- **A lazy assert waves a bug through**, because the check was authored by the
+  thing that produced the bug.
+
+Writing the spec first removes both. It cannot be rationalised around an
+implementation that does not exist yet, and it does not move between retries — a
+retry aims at the same target it just missed, which is the only way a failure
+means anything.
+
+`reviewer_node` then runs the code against that spec in a harness that **imports**
+the module rather than executing it as a script. Any test block the editor left
+behind therefore does not run: the code is judged against the spec, and only
+against the spec.
+
+### When the spec itself is wrong
+
+A spec writer is a model too, so an acceptance assertion can also be false. When
+one fails, `reviewer_node` adjudicates before blaming the code: *is this assertion
+even right, given the task?*
+
+That opens the obvious hole — "delete the test until it passes" — so it is fenced
+in on every side:
+
+- the adjudicator is biased hard toward `CODE_WRONG`, and every ambiguous or
+  unparseable verdict resolves that way (the safe answer is the old behaviour);
+- a dead or erroring adjudicator also resolves to `CODE_WRONG`, so a broken
+  model can never delete a check;
+- at most `SPEC_REPAIR_LIMIT` (2) assertions may be dropped per task;
+- the last remaining assertion is never dropped;
+- every drop is logged to the rejection ledger.
+
+`tests/test_acceptance_spec.py` pins all of these. They are the load-bearing part.
+
 ## Why there are two reviewers
 
 `reviewer_node` runs the generated code in a sandboxed subprocess. It proves the

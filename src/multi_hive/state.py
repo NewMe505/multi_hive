@@ -106,6 +106,21 @@ class HiveState(TypedDict):
     # "PASS", "FAIL: <reason>", or None (not yet evaluated).
     # Reset to None by agent_router_node at the start of each new task.
     semantic_verdict: str | None
+    # The acceptance criteria for the current task: bare `assert` statements,
+    # written by spec_writer_node from the TASK, before any code exists.
+    #
+    # These replace the asserts the editor used to write about its own code. A
+    # model that grades its own homework fails both ways — a wrong assert rejects
+    # correct code, a lazy one waves through a bug — and both were observed. The
+    # editor now implements against this contract and cannot edit it.
+    #
+    # reviewer_node may DROP an assertion here, but only after adjudication says
+    # the assertion contradicts the task, at most SPEC_REPAIR_LIMIT times, and
+    # never the last one. Every drop is logged.
+    acceptance: list[str]
+    # How many assertions have been adjudicated away for this task. Bounds the
+    # obvious attack: deleting the spec until the code trivially passes.
+    spec_repairs: int
     # "trivial" | "moderate" | "hard" — a cheap text-only prior on difficulty,
     # set by agent_router_node. Seeds the initial model tier.
     task_complexity: str | None

@@ -76,6 +76,19 @@ Nodes communicate only through `HiveState` (`state.py`). Its error-propagation
 contract is documented there and is enforced by convention, not by types — read
 it before adding a node that writes `editor_error` or `editor_retries`.
 
+**The editor does not write its own tests.** `spec_writer_node` derives the
+acceptance criteria from the task, before any code exists; the editor is shown
+them and cannot change them. A model that grades its own homework fails both ways
+— it once asserted `wrap_text("hello world", 10) == ["hello world"]` (eleven
+characters, width ten) and rejected its own correct code. If you are tempted to
+let the editor emit asserts again, read `spec_writer_node.py` first.
+
+The adjudicator in `reviewer_node` can drop a *wrong* acceptance assertion. That
+is the most dangerous code here — "delete the test until it passes" is how a model
+would cheat — so it is bounded (`SPEC_REPAIR_LIMIT`), never drops the last
+assertion, and defaults to blaming the code on any doubt or error. Do not loosen
+those guards.
+
 **Two invariants the whole loop rests on.** Both were broken at some point, and
 both broke it badly:
 

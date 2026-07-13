@@ -132,6 +132,10 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         get_recent_rejections("async_editor_node"),
         get_recent_rejections("reviewer_node"),
         get_recent_rejections("semantic_reviewer_node"),
+        # The contract, written from the task by spec_writer_node. The editor is
+        # shown it and must satisfy it — but it does not author it and cannot
+        # change it. That separation is the whole point.
+        acceptance=state.get("acceptance") or [],
     )
 
     # Full text for the active file; signature outlines for everything else.

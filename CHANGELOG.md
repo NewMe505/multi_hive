@@ -11,6 +11,41 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Changed
+
+- **The editor no longer writes its own tests.** It used to author both the
+  implementation *and* the asserts that judged it — a model grading its own
+  homework, which fails in both directions:
+
+  - **A wrong assert rejects correct code.** Observed live: the model asserted
+    `wrap_text("hello world", 10) == ["hello world"]`. That string is eleven
+    characters and the width is ten, so it cannot fit — the assertion was simply
+    false. Its own test rejected its own *correct* implementation, burnt the retry
+    budget, escalated the model tier, and woke a human. The benchmark caught this
+    as a task that passed the hidden tests while escalating to the human gate.
+  - **A lazy assert waves a bug through**, because the check was written by the
+    thing that produced the bug.
+
+  `spec_writer_node` now derives the acceptance criteria from the **task**, before
+  any implementation exists to rationalise them against, and they do not move
+  between retries. The editor is shown the contract, must satisfy it, and cannot
+  change it. `reviewer_node` runs the code against that spec in a harness that
+  **imports** the module rather than running it as a script — so any test block
+  the editor leaves behind never executes.
+
+- **When the spec itself is wrong, it is adjudicated, not obeyed.** A spec writer
+  is a model too. When an acceptance assertion fails, `reviewer_node` asks whether
+  the *assertion* contradicts the task before blaming the code.
+
+  This opens the obvious hole — delete the test until it passes — so it is fenced
+  in: the adjudicator is biased hard toward `CODE_WRONG` and every ambiguous or
+  unparseable verdict resolves that way; a dead adjudicator also resolves that way;
+  at most `SPEC_REPAIR_LIMIT` (2) assertions may be dropped per task; the last
+  assertion is never dropped; and every drop is logged. Acceptance assertions are
+  also parsed strictly — anything reaching for `import`, `open`, `eval`, or `exec`
+  is refused, because these lines execute inside the sandbox and model output is
+  untrusted input.
+
 ## [4.5.0] - 2026-07-12
 
 ### Fixed

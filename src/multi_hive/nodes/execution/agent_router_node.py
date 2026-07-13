@@ -48,4 +48,10 @@ def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
         "semantic_verdict": None,
         "task_complexity": complexity,
         "model_tier": tier,
+        # A new task needs a new contract. Clearing it here is what makes
+        # spec_writer_node generate one — and, just as importantly, what stops a
+        # retry from getting fresh goalposts: the spec is written once per task,
+        # not once per attempt.
+        "acceptance": [],
+        "spec_repairs": 0,
     }

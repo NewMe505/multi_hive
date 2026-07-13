@@ -133,6 +133,8 @@ async def run_sprint(task: Task) -> dict[str, Any]:
         "is_ui_task": False,
         "loop_health": default_loop_health(),
         "semantic_verdict": None,
+        "acceptance": [],
+        "spec_repairs": 0,
         "task_complexity": None,
         "model_tier": None,
         "human_gate_event": None,  # headless: the gate must not wait for a human
