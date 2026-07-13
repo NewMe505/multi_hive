@@ -94,6 +94,25 @@ async def semantic_reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
     if not current_code:
         return {}
 
+    # A human-written acceptance contract just passed. Stand down.
+    #
+    # This node exists because nothing else was checking intent. When a human has
+    # written executable asserts describing what the program must do, and the
+    # program satisfies them, something else IS checking intent — and it is a
+    # better check than this one by every measure that matters. It is exact
+    # rather than probabilistic, it costs no inference, and it cannot invent a
+    # complaint. This node, by contrast, is a 7B model asked to find fault, and
+    # asking a 7B model to find fault is a good way to be handed one: the entire
+    # "NEVER REJECT" section of its prompt is a scar list of false rejections.
+    #
+    # It still advances the task, because a task that passes every gate and is
+    # never retired is a task the graph will re-verify forever.
+    if state.get("contract_satisfied"):
+        return {
+            "semantic_verdict": "PASS (acceptance contract satisfied)",
+            **_advance(state),
+        }
+
     # Already escalated — reviewing a sprint that is on its way to the human
     # gate wastes an inference pass and cannot change the routing.
     if (state.get("loop_health") or {}).get("escalated"):

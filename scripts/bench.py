@@ -2,6 +2,7 @@
 bench.py — the performance tracker.
 
     python scripts/bench.py sprint              # the one to track during development
+    python scripts/bench.py sprint --contract   # with human-written acceptance contracts
     python scripts/bench.py models              # when choosing or replacing a tier
     python scripts/bench.py models --models qwen2.5-coder:7b qwen3-coder:30b
 
@@ -14,6 +15,14 @@ used as a baseline — a benchmark of uncommitted code cannot be reproduced.
 
 Grading is against hidden test suites the model never sees. See
 src/multi_hive/bench/suite.py for what each task is actually probing, and why.
+
+--contract runs the same tasks with a human-written acceptance contract attached
+(src/multi_hive/bench/contracts.py). It is recorded under the subject
+"hive+contract", which keeps it on its own baseline, because it is not the same
+measurement: plain `sprint` asks whether the hive can guess what you meant, and
+`--contract` asks whether it delivers what you actually specified. Comparing the
+two scores to each other means nothing. Comparing each to its own history means
+everything.
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 # stdio is cp1252, and this script emits ✓/✗).
 import multi_hive.core.console  # noqa: E402, F401
 from multi_hive.bench import history, runner  # noqa: E402
+from multi_hive.bench.contracts import contract_for_task  # noqa: E402
 from multi_hive.bench.suite import TASKS  # noqa: E402
 
 DEFAULT_MODELS = ["qwen2.5-coder:7b", "qwen3-coder:30b"]
@@ -63,21 +73,49 @@ def bench_models(models: list[str]) -> list[history.Run]:
     return runs
 
 
-def bench_sprint() -> list[history.Run]:
-    print(f"\n{BOLD}=== full hive, end to end ==={RESET}", flush=True)
-    run = history.Run(suite="sprint", subject="hive").stamp()
+def bench_sprint(contract: bool = False) -> list[history.Run]:
+    label = "full hive + acceptance contracts" if contract else "full hive, end to end"
+    print(f"\n{BOLD}=== {label} ==={RESET}", flush=True)
+
+    # A separate subject, so history.baseline_for() never compares a contract run
+    # against a no-contract one. They answer different questions; a "regression"
+    # between them would be an artefact of the mode, not a change in the code.
+    subject = "hive+contract" if contract else "hive"
+    run = history.Run(suite="sprint", subject=subject).stamp()
+
+    gamed: list[str] = []
 
     for task in TASKS:
         print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
-        result = asyncio.run(runner.run_sprint(task))
+        result = asyncio.run(
+            runner.run_sprint(task, contract_for_task(task.name) if contract else "")
+        )
         run.tasks.append(result)
 
         tiers = "→".join(result["tiers"]) or "—"
         why = f"  {DIM}({result['failure'][:50]}){RESET}" if result["failure"] else ""
         gate = f" {RED}[human gate]{RESET}" if result["escalated_to_human"] else ""
+
+        # Contract satisfied, hidden suite failed: the code cleared the asserts it
+        # was shown and failed the ones it was not. That is the signature of
+        # hardcoding against the contract's literals, and it is the one outcome
+        # that would invalidate the whole approach — so it gets shouted, not
+        # buried in a summary line.
+        if contract and result.get("contract_satisfied") and not result["passed"]:
+            gamed.append(task.name)
+            gate += f" {RED}{BOLD}[CONTRACT GAMED]{RESET}"
+
         print(
             f"{result['wall_sec']:6.1f}s  {result['nodes']:3d} nodes  "
             f"tier={tiers:12} {_mark(result['passed'])}{gate}{why}"
+        )
+
+    if gamed:
+        print(
+            f"\n  {RED}{BOLD}CONTRACT GAMED on {', '.join(gamed)}{RESET} — the contract "
+            f"passed and the hidden suite did not.\n  {DIM}The model satisfied the "
+            f"literals it was shown without implementing the requirement. Tighten the "
+            f"anti-hardcoding rule in prompts._EDITOR_CONTRACT_PREFIX.{RESET}"
         )
 
     return [run]
@@ -159,12 +197,24 @@ def main() -> None:
         action="store_true",
         help="exit 1 if this run regressed against its baseline",
     )
+    parser.add_argument(
+        "--contract",
+        action="store_true",
+        help=(
+            "attach the human-written acceptance contracts (bench/contracts.py). "
+            "Recorded as a separate subject; not comparable to a plain sprint run."
+        ),
+    )
     args = parser.parse_args()
 
     if args.suite == "history":
         raise SystemExit(show_history())
 
-    runs = bench_models(args.models) if args.suite == "models" else bench_sprint()
+    runs = (
+        bench_models(args.models)
+        if args.suite == "models"
+        else bench_sprint(contract=args.contract)
+    )
     raise SystemExit(report(runs, args.check))
 
 

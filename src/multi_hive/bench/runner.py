@@ -24,6 +24,7 @@ import requests
 
 from multi_hive.bench.suite import Task, grade
 from multi_hive.config import OUTPUTS_DIR, RECURSION_LIMIT, ensure_workspace
+from multi_hive.contract import normalise_target
 from multi_hive.prompts import get_editor_prompt
 
 OLLAMA = "http://127.0.0.1:11434"
@@ -100,7 +101,7 @@ def run_model(model: str, task: Task, num_ctx: int = 4096, num_predict: int = 20
     }
 
 
-async def run_sprint(task: Task) -> dict[str, Any]:
+async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
     """
     One task, through the entire graph, graded on the file that lands on disk.
 
@@ -108,6 +109,16 @@ async def run_sprint(task: Task) -> dict[str, Any]:
     model's response: what the hive *wrote* is the product. If the editor
     generated perfect code and the reviewer failed to flush it, that is a
     failure, and it should be scored as one.
+
+    `contract` supplies a human-written acceptance contract for the task's file,
+    which is a different mode of operation and a different question. Without one,
+    the bench asks "can the hive guess what I meant?". With one, it asks "when I
+    say exactly what I want, does the hive deliver it?" — which is the question
+    the feature was built to answer, and the only one a contract can be scored on.
+
+    The two are NOT comparable, and history keeps them apart by subject. Grading
+    is against the hidden suite either way, and the hidden suite never sees the
+    contract: see bench/contracts.py for why that makes it a gaming detector.
     """
     from langchain_core.messages import HumanMessage
 
@@ -120,10 +131,12 @@ async def run_sprint(task: Task) -> dict[str, Any]:
     if artefact.exists():
         artefact.unlink()  # never grade a previous run's leftovers
 
+    target = f"outputs/{task.filename}"
+
     initial = {
         "messages": [HumanMessage(content=task.objective)],
         "project_files": {},
-        "active_file": f"outputs/{task.filename}",
+        "active_file": target,
         "task_queue": [],
         "current_task": None,
         "editor_error": None,
@@ -135,6 +148,8 @@ async def run_sprint(task: Task) -> dict[str, Any]:
         "semantic_verdict": None,
         "task_complexity": None,
         "model_tier": None,
+        "contracts": {normalise_target(target): contract} if contract else {},
+        "contract_satisfied": None,
         "human_gate_event": None,  # headless: the gate must not wait for a human
     }
 
@@ -143,6 +158,7 @@ async def run_sprint(task: Task) -> dict[str, Any]:
     tiers: list[str] = []
     escalated = False
     error: str | None = None
+    contract_satisfied: bool | None = None
 
     try:
         async for output in hive_app.astream(
@@ -157,6 +173,8 @@ async def run_sprint(task: Task) -> dict[str, Any]:
                     escalated = escalated or bool((delta["loop_health"] or {}).get("escalated"))
                 if "editor_error" in delta:
                     error = delta["editor_error"]
+                if delta.get("contract_satisfied") is not None:
+                    contract_satisfied = delta["contract_satisfied"]
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
 
@@ -175,4 +193,9 @@ async def run_sprint(task: Task) -> dict[str, Any]:
         "tiers": tiers,           # ["fast"] or ["fast", "strong"] — did it escalate?
         "escalated_to_human": escalated,
         "wrote_artefact": bool(code),
+        # The gaming detector. In contract mode, contract_satisfied=True with
+        # passed=False means the code cleared the human's asserts and failed the
+        # hidden ones — which is what memorising the contract's literal inputs
+        # looks like from the outside. bench.py flags it loudly.
+        "contract_satisfied": contract_satisfied,
     }

@@ -40,12 +40,18 @@ def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
     # loop_health resets at the start of every task: a repeat_error_hash left
     # over from the previous task would otherwise trip an escalation on the
     # first retry of an unrelated one.
+    #
+    # contract_satisfied resets for the same reason, and it matters more: a True
+    # left over from the previous file would tell semantic_reviewer_node to stand
+    # down for a file whose contract has not been run yet — retiring the task on
+    # the strength of a different file's passing grade.
     return {
         "specialist_context": specialist_context.strip(),
         "is_ui_task": is_ui_task,
         "editor_retries": 0,
         "loop_health": default_loop_health(),
         "semantic_verdict": None,
+        "contract_satisfied": None,
         "task_complexity": complexity,
         "model_tier": tier,
     }

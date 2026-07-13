@@ -14,12 +14,13 @@ pytest                                  # fast; run it constantly
 ruff check --fix src tests scripts
 multi-hive                              # or: python -m multi_hive
 
-python scripts/bench.py sprint          # end-to-end; track this during development
-python scripts/bench.py sprint --check  # exit 1 on a regression (CI gate)
-python scripts/bench.py models          # raw models; use when choosing a tier
-python scripts/bench.py history         # the trend, run by run
+python scripts/bench.py sprint            # end-to-end; track this during development
+python scripts/bench.py sprint --contract # ...with human-written acceptance contracts
+python scripts/bench.py sprint --check    # exit 1 on a regression (CI gate)
+python scripts/bench.py models            # raw models; use when choosing a tier
+python scripts/bench.py history           # the trend, run by run
 
-python scripts/release.py patch         # bump, changelog, commit, tag
+python scripts/release.py patch           # bump, changelog, commit, tag
 ```
 
 `bench.py sprint` is the number that matters: it drives the real graph and grades
@@ -90,3 +91,22 @@ both broke it badly:
    counter, and the hive shipped crashing code under a green "Sprint Complete".
 
 `tests/test_loop_terminates.py` pins both. Do not weaken them.
+
+## Acceptance contracts
+
+The editor writing both the code and the asserts that judge it is a conflict of
+interest that has cost real sprints — it once rejected its own correct code for
+failing an assert that was arithmetically impossible. A human-written
+`ACCEPTANCE` block (see `contract.py`) replaces the model's self-asserts with the
+human's, and `semantic_reviewer_node` stands down when one passes.
+
+Two things here are not optional and are easy to quietly break:
+
+- **Never leave the code unverified.** Deleting the self-asserts *without* a
+  contract to replace them was measured at 1/4, down from 3/4. A flawed check
+  beats no check. If a file has no contract, the old self-assert path stays.
+- **Never copy an assert from `bench/suite.py` into `bench/contracts.py`.** The
+  editor sees the contract and never sees the hidden suite, which is precisely
+  what makes the suite a gaming detector. Sharing a literal across the two turns
+  the benchmark into an open-book exam. `tests/test_contract.py` fails the build
+  if you do it.

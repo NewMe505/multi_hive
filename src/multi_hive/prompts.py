@@ -7,6 +7,26 @@ control flow.
 """
 from __future__ import annotations
 
+_EDITOR_CONTRACT_PREFIX = (
+    "Modify the Python code to fulfill the task.\n"
+    "1. Output the FULL updated script inside a single ```python ... ``` block. "
+    "No prose before or after the block.\n"
+    "2. An ACCEPTANCE CONTRACT is supplied below. A human wrote it. It is the ONLY "
+    "thing your code will be judged on.\n"
+    "3. DO NOT write asserts, tests, example usage, or an "
+    "`if __name__ == '__main__':` block. Your module will be IMPORTED and the "
+    "contract executed against it — any test code you write will never run.\n"
+    "4. Every name the contract calls must exist at module level, spelled exactly "
+    "as the contract spells it.\n"
+    "5. DO NOT special-case the contract's literal inputs. Hardcoding the expected "
+    "answers is a failure: your code will also be run on inputs that are not in "
+    "the contract, and it must be correct on those too.\n"
+    "6. SAVE PATH RULE: Write the file to the EXACT path specified in the task. "
+    "   Do not invent a different filename or directory.\n"
+    "7. IF CREATING UI (Tkinter/GUI): Separate logic into Controller and View classes. "
+    "   Logic must be testable without launching the window.\n\n"
+)
+
 _EDITOR_STATIC_PREFIX = (
     "Modify the Python code to fulfill the task.\n"
     "1. Output the FULL updated script inside a single ```python ... ``` block. "
@@ -102,6 +122,7 @@ def get_editor_prompt(
     past_gen_failures: str = "",
     past_runtime_failures: str = "",
     past_semantic_failures: str = "",
+    acceptance_contract: str = "",
 ) -> str:
     """
     Builds the editor system prompt.
@@ -117,12 +138,26 @@ def get_editor_prompt(
 
     Merging them produces incoherent retries: the model doesn't know whether to
     change the structure, the logic, or the intent.
+
+    acceptance_contract switches the prompt into contract mode: the model is told
+    to write no asserts at all, because a human already wrote the ones that count.
+    The ASSERT RULES in _EDITOR_STATIC_PREFIX are damage control for the case
+    where nobody did — a long list of things the model must not assert about,
+    accumulated one false rejection at a time. They help. They do not solve it:
+    the model still cannot reliably tell a true statement about its own code from
+    a false one. A contract removes the question instead of refining it.
     """
-    prompt = (
-        _EDITOR_STATIC_PREFIX
-        + f"GLOBAL RULES:\n{global_objective}\n\n"
-        + f"{specialist_context}\n"
-    )
+    prefix = _EDITOR_CONTRACT_PREFIX if acceptance_contract else _EDITOR_STATIC_PREFIX
+
+    prompt = prefix + f"GLOBAL RULES:\n{global_objective}\n\n" + f"{specialist_context}\n"
+
+    if acceptance_contract:
+        fence = chr(96) * 3
+        prompt += (
+            "\nACCEPTANCE CONTRACT — your code is judged on this and nothing else. "
+            "Every line of it must pass:\n"
+            f"{fence}python\n{acceptance_contract}\n{fence}\n"
+        )
 
     if past_gen_failures:
         prompt += (

@@ -11,6 +11,77 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Added
+
+- **Human-supplied acceptance contracts.** The fix for the self-authored assert
+  problem, and the first thing in this system that removes the model from a job
+  it was never able to do.
+
+  The editor wrote the implementation *and* the asserts that judged it. Asked to
+  wrap text at width 10, it wrote `assert wrap_text("hello world", 10) ==
+  ["hello world"]` — eleven characters into a width of ten. The implementation was
+  correct; the assert was arithmetically impossible. So it rejected its own
+  working code, burned the retry budget, escalated to the strong model, and woke a
+  human. Nothing was wrong with the program.
+
+  Two earlier attempts to fix this inside the model failed, and both are recorded
+  on `experiment/acceptance-spec`: a second model writing the spec (measured at
+  3.11x slower for zero quality gain, reverted), and removing the self-asserts
+  with nothing to replace them (1/4 — a flawed check still beats no check). The
+  missing information is not *in* the model. It is in the human. So the human now
+  supplies it:
+
+  ```
+  Save it to outputs/wrap.py
+
+  ACCEPTANCE outputs/wrap.py
+  assert wrap_text("supercalifragilistic", 6) == ["superc", "alifra", "gilist", "ic"]
+  ```
+
+  When a file has a contract: the editor is told to write **no asserts at all**;
+  `reviewer_node` **imports** the module and executes the human's asserts against
+  it, so any test code the model wrote anyway is dead (`__name__` is not
+  `"__main__"` under import); and `semantic_reviewer_node` stands down, because an
+  exact executable contract outranks a 7B model asked to find fault — and that
+  reviewer is the other source of false rejections. A violated assert routes
+  through the existing retry and escalation ladder, which is now being fed ground
+  truth instead of the model's opinion of itself.
+
+  Measured on `word_wrap` — the task **neither tier could pass**, and the task that
+  produced the impossible assert: contract satisfied on the **fast** tier, first
+  attempt, no escalation, no human gate, and the artefact passes the hidden suite
+  with a real hard-split loop. Not a memorised one — see below.
+
+- **`--objective PATH` and `@path`.** A contract is several lines of Python and
+  the REPL reads one line, so an objective carrying one has to arrive from a file.
+  `multi-hive --objective examples/wrap_text.md` runs a single sprint and exits,
+  which is also what CI wants; `@path` does the same from the prompt.
+
+- **`bench.py sprint --contract`**, and `bench/contracts.py` — acceptance contracts
+  for all four bench tasks, derived only from what each prompt already states in
+  prose.
+
+  The editor *sees* the contract, so it could hardcode against it. The prompt
+  forbids that, but a prompt is not a guarantee — so the benchmark detects it. Every
+  literal in `bench/contracts.py` differs from the hidden suite's: the contract
+  hard-splits `"supercalifragilistic"` at width 6, the hidden test splits
+  `"abcdefghij"` at width 4. Same requirement, different numbers. Which makes the
+  hidden suite a working gaming detector: memorised code passes the contract and
+  **fails the bench**, and `--contract` shouts `[CONTRACT GAMED]` when a satisfied
+  contract meets a failed hidden suite. `tests/test_contract.py` fails the build if
+  anyone ever copies an assert across, which is the tempting and fatal shortcut.
+
+  Recorded under a separate subject (`hive+contract`) so it never shares a baseline
+  with a plain run: plain asks whether the hive can guess what you meant, contract
+  asks whether it delivers what you specified, and comparing those two numbers to
+  each other means nothing.
+
+### Fixed
+
+- **`HIVE_MAX_INPUT_CHARS` truncated the whole objective, contract included.** Now
+  it caps the prose only. Trimming prose is lossy; trimming a contract mid-assert
+  corrupts the one part of the input that is exactly, literally true.
+
 ## [4.5.0] - 2026-07-12
 
 ### Fixed

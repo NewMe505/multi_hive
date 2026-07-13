@@ -3,6 +3,17 @@ cli.py — the REPL entrypoint.
 
 Run with `multi-hive`, or `python -m multi_hive`.
 
+    [USER_OBJECTIVE] > Implement a word wrapper. Save it to outputs/wrap.py
+    [USER_OBJECTIVE] > @tasks/wrap.md          <- load the objective from a file
+    multi-hive --objective tasks/wrap.md       <- one sprint, no REPL
+
+Objectives from a file
+----------------------
+An objective may carry a human-written ACCEPTANCE contract (see contract.py),
+and a contract is several lines of Python. The REPL reads one line, so the two
+do not fit together: hence `@path` and `--objective path`, which are the only
+sane way to hand the hive a contract. The one-shot form is also what CI wants.
+
 stdin ownership
 ---------------
 Two things want to read the keyboard: the REPL (waiting for the next
@@ -20,10 +31,12 @@ more than once.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 from rich.panel import Panel
@@ -35,6 +48,7 @@ from multi_hive.config import (
     WORKSPACE_DIR,
     ensure_workspace,
 )
+from multi_hive.contract import ContractError, assert_count, parse_objective
 from multi_hive.core import llm_factory
 from multi_hive.core.console import console
 from multi_hive.core.memory import clear_ledger
@@ -110,10 +124,42 @@ async def _acknowledge_on_input(broker: StdinBroker, gate_event: asyncio.Event) 
 async def run_sprint(user_input: str, broker: StdinBroker) -> None:
     clear_ledger()
 
+    # The objective handed to the planner is the one with the ACCEPTANCE blocks
+    # removed. A planner shown a contract plans work to satisfy it — "Step 3:
+    # write the tests" — which is the exact job the contract exists to take away
+    # from the model. The editor gets the contract separately, per file.
+    #
+    # ContractError propagates: a contract that does not compile is a mistake by
+    # the human at the keyboard, and it should be reported to them now, not
+    # discovered forty seconds into a doomed sprint.
+    objective, contracts = parse_objective(user_input)
+
+    # Cap the prose, never the contract.
+    #
+    # A multi-KB objective silently overflows the ticket model's num_ctx and
+    # produces garbled planning with no visible error, so it is capped. But this
+    # cap must not be allowed anywhere near a contract: truncating one mid-assert
+    # would either corrupt what the human asserted or, at best, fail to compile —
+    # and the whole point of the contract is that it is the one part of the input
+    # that is exactly, literally true. Trimming the prose is lossy. Trimming the
+    # contract is a correctness bug.
+    if len(objective) > MAX_INPUT_CHARS:
+        console.print(
+            f"[yellow]⚠️  Objective truncated from {len(objective)} to "
+            f"{MAX_INPUT_CHARS} chars to stay within the planner context window.[/]"
+        )
+        objective = objective[:MAX_INPUT_CHARS]
+
+    for target, body in contracts.items():
+        console.print(
+            f"📜 [bold]acceptance contract[/] for [cyan]{target}[/] "
+            f"([dim]{assert_count(body)} asserts — the model writes none[/])"
+        )
+
     gate_event = asyncio.Event()
 
     initial_state: HiveState = {
-        "messages": [HumanMessage(content=user_input)],
+        "messages": [HumanMessage(content=objective)],
         "project_files": {},
         "active_file": "outputs/main.py",
         "task_queue": [],
@@ -127,6 +173,8 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
         "semantic_verdict": None,
         "task_complexity": None,
         "model_tier": None,
+        "contracts": contracts,
+        "contract_satisfied": None,
         "human_gate_event": gate_event,
     }
 
@@ -215,7 +263,45 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
     )
 
 
-async def main() -> None:
+def _expand(user_input: str) -> str:
+    """
+    Resolves the `@path` form to the contents of that file.
+
+    A contract is multi-line and the REPL is not, so an objective carrying one
+    has to arrive from somewhere other than a single typed line. `@path` is that
+    somewhere. The path is typed by the human, so it is read from the working
+    directory as given — this is not the model-authored path boundary, and
+    safe_path() has no business here.
+    """
+    if not user_input.startswith("@"):
+        return user_input
+
+    path = Path(user_input[1:].strip().strip("\"'"))
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ContractError(f"cannot read objective file {str(path)!r}: {e}") from e
+
+
+async def _sprint_once(user_input: str, broker: StdinBroker) -> bool:
+    """One sprint. Returns False if the REPL should stop."""
+    try:
+        await run_sprint(user_input, broker)
+    except ContractError as e:
+        # The human's own input is malformed. Report it and stay alive — this is
+        # a typo, not a crash, and killing the REPL over a typo is obnoxious.
+        console.print(f"[bold red]✗ {e}[/]")
+    except Exception as e:
+        import traceback
+
+        console.print(f"[bold red]❌ FATAL: {e}[/]")
+        console.print(f"[dim]{traceback.format_exc()}[/]")
+        console.print(f"[dim]Check {WORKSPACE_DIR} for partially written files.[/]")
+        return False
+    return True
+
+
+async def main(objective_file: str | None = None) -> None:
     ensure_workspace()
 
     console.print(
@@ -231,6 +317,16 @@ async def main() -> None:
     broker.start()
 
     try:
+        # One-shot: an objective file, one sprint, exit. The broker still runs —
+        # a human at a terminal can still acknowledge an escalation, and at EOF
+        # the gate auto-acknowledges, which is what CI needs.
+        if objective_file:
+            try:
+                await _sprint_once(_expand(f"@{objective_file}"), broker)
+            except ContractError as e:
+                console.print(f"[bold red]✗ {e}[/]")
+            return
+
         while True:
             console.print("\n[bold green][USER_OBJECTIVE] >[/] ", end="")
 
@@ -246,24 +342,13 @@ async def main() -> None:
             if not user_input:
                 continue
 
-            # Cap raw input before it reaches any LLM context window. A multi-KB
-            # paste silently overflows the ticket model's 2048-token num_ctx and
-            # produces garbled planning with no visible error.
-            if len(user_input) > MAX_INPUT_CHARS:
-                console.print(
-                    f"[yellow]⚠️  Input truncated from {len(user_input)} to "
-                    f"{MAX_INPUT_CHARS} chars to stay within the planner context window.[/]"
-                )
-                user_input = user_input[:MAX_INPUT_CHARS]
-
             try:
-                await run_sprint(user_input, broker)
-            except Exception as e:
-                import traceback
+                expanded = _expand(user_input)
+            except ContractError as e:
+                console.print(f"[bold red]✗ {e}[/]")
+                continue
 
-                console.print(f"[bold red]❌ FATAL: {e}[/]")
-                console.print(f"[dim]{traceback.format_exc()}[/]")
-                console.print(f"[dim]Check {WORKSPACE_DIR} for partially written files.[/]")
+            if not await _sprint_once(expanded, broker):
                 break
     finally:
         await broker.close()
@@ -272,8 +357,22 @@ async def main() -> None:
 
 def run() -> None:
     """Console-script entrypoint."""
+    parser = argparse.ArgumentParser(
+        prog="multi-hive",
+        description="Async self-healing multi-file code generation.",
+    )
+    parser.add_argument(
+        "--objective",
+        metavar="PATH",
+        help=(
+            "run a single sprint from an objective file, then exit. "
+            "The file may carry ACCEPTANCE contract blocks; see contract.py."
+        ),
+    )
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(args.objective))
     except KeyboardInterrupt:
         console.print("\n[dim]^C — Shutting down.[/]")
 

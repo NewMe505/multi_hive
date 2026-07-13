@@ -57,11 +57,15 @@ class HiveState(TypedDict):
       retires a task.
     - reviewer_node: sets editor_error and bumps editor_retries when the code
       fails to run; clears editor_error when it runs. Does NOT retire the task.
+      With a contract in play it runs the human's asserts instead of the model's
+      script, and records the outcome in contract_satisfied.
     - semantic_reviewer_node: the last gate, and therefore the ONLY node that
       retires a task. On PASS it clears editor_error, resets editor_retries,
       and pulls the next task off the queue. On FAIL it injects the verdict as
       editor_error and bumps editor_retries, so the rejection routes through
-      the existing retry loop.
+      the existing retry loop. It stands down entirely (auto-PASS, advance) when
+      contract_satisfied is True — a human's executable contract outranks a 7B
+      model's opinion, and it still retires the task, because something must.
     - agent_router_node: never touches editor_error; always resets
       editor_retries and loop_health (it only runs at the start of a new task).
     - ticket_writer: may set editor_error once for a JSON-parse failure,
@@ -117,5 +121,21 @@ class HiveState(TypedDict):
     # models do not fit in VRAM together, so a tier that could flip back and
     # forth mid-task would thrash the GPU. See core/model_router.py.
     model_tier: str | None
+    # Human-written acceptance contracts, keyed by normalised file path (plus a
+    # "*" wildcard for the single-file case). Parsed once from the objective by
+    # the entrypoint; read-only for every node. See contract.py.
+    #
+    # A file with a contract is judged by the human's asserts instead of the
+    # model's own — which is the whole point, because the model writing both the
+    # code and the asserts that judge it is a conflict of interest that has
+    # already cost real sprints (it once rejected correct code for failing an
+    # assert that was arithmetically impossible to satisfy).
+    contracts: dict[str, str]
+    # True once reviewer_node has run the contract for the current file and it
+    # held; False if it was violated; None when there is no contract, or before
+    # the first review. Reset per task by agent_router_node.
+    #
+    # semantic_reviewer_node reads this and stands down when it is True.
+    contract_satisfied: bool | None
     # asyncio.Event — injected per sprint, not checkpointed.
     human_gate_event: Any | None

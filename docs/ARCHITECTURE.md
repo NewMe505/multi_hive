@@ -77,6 +77,82 @@ rejections, zero escalations.**
 A task is finished when *both* reviewers pass, and only the last one to run is in
 a position to know that. `tests/test_loop_terminates.py` pins this.
 
+## The acceptance contract
+
+Both reviewers are guesses about intent, and both can guess wrong. Underneath
+them sits a deeper problem that no amount of reviewing fixes: **the editor writes
+the implementation and the asserts that judge it.**
+
+Asked to wrap text at a width of 10, the model wrote:
+
+```python
+assert wrap_text("hello world", 10) == ["hello world"]
+```
+
+Eleven characters into a width of ten. The implementation was correct. The assert
+was arithmetically impossible. So `reviewer_node` — doing its job perfectly —
+reported a failure, correct code was rejected, the retry budget burned, the tier
+escalated, and a human was woken. Nothing was wrong with the program.
+
+Two fixes were tried inside the model and both are recorded on
+`experiment/acceptance-spec`, unmerged:
+
+1. **A second model writes the spec first** (`spec_writer_node`), before any code
+   exists. Measured: **3.11x slower for zero quality gain**, and the 7B still
+   could not produce a usable spec for `word_wrap` — the one task that needed it.
+   Reverted.
+2. **Delete the self-asserts and trust the semantic reviewer.** Measured: **1/4**,
+   down from 3/4. Nothing was checking the code any more. *A flawed check beats no
+   check* — that is the durable finding, and it is why contract mode does not
+   simply switch verification off.
+
+Both failed for the same reason. The missing information — what *correct* means —
+is not in the model, so no rearrangement of models can produce it. It is in the
+human.
+
+So the human writes it:
+
+```
+ACCEPTANCE outputs/wrap.py
+assert wrap_text("supercalifragilistic", 6) == ["superc", "alifra", "gilist", "ic"]
+```
+
+`contract.py` parses the block out of the objective (the planner never sees it —
+shown a contract, a planner plans "Step 3: write the tests", which is the exact
+job being taken away). Then, for any file that has one:
+
+- **The editor writes no asserts.** A different system prompt entirely, and the
+  contract is handed to it as the spec — hiding it would mean asking the model to
+  guess the thing the human just took the trouble to write down.
+- **`reviewer_node` imports the module** and executes the human's asserts against
+  it, instead of running the model's script. Under import, `__name__` is
+  `"candidate"` — so any test block the model wrote anyway is dead code and
+  *cannot* reject correct code. The mechanism does not depend on the model obeying
+  the prompt.
+- **`semantic_reviewer_node` stands down.** An exact, executable, human-written
+  contract outranks a 7B model asked to find fault — and asking a 7B model to find
+  fault is a good way to be handed one. The entire `NEVER REJECT` section of its
+  prompt is a scar list of false rejections. It still *advances* the task, because
+  something has to (see above).
+
+A violated assert is injected as `editor_error` and routes through the existing
+retry and escalation ladder. Nothing new was built for failure handling; the loop
+is simply, for the first time, being fed ground truth instead of the model's
+opinion of itself.
+
+### Gaming, and how the benchmark detects it
+
+The editor sees the contract, so it could hardcode against its literals. The
+prompt forbids it — and a prompt is not a guarantee, so the benchmark checks.
+
+Every literal in `bench/contracts.py` differs from the hidden suite's: the
+contract hard-splits `"supercalifragilistic"` at width 6, the hidden test splits
+`"abcdefghij"` at width 4. Same requirement, different numbers. That makes the
+hidden suite a **gaming detector** — memorised code passes the contract and fails
+the bench, and `--contract` reports `[CONTRACT GAMED]` on any task where a
+satisfied contract meets a failed hidden suite. `tests/test_contract.py` fails the
+build if anyone copies an assert across, which is the tempting and fatal shortcut.
+
 ## How the loop protects itself
 
 **Retry cap.** `MAX_RETRIES` failures on one task routes to the human gate.
@@ -166,13 +242,20 @@ The 30B is **faster than the 14B despite being twice the size**, because it is
 mixture-of-experts — roughly 3B parameters active per token. Bigger model, less
 VRAM-bound, faster.
 
-The quality column comes from `scripts/bench_models.py`, which grades against
+The quality column comes from `scripts/bench.py models`, which grades against
 hidden test suites the model never sees. Both tiers clear the *moderate* tasks,
 so routing those to the fast model costs nothing. The strong model wins on
 *hard* ones — it implements semver precedence correctly where the 7B silently
 ignores build metadata, which is exactly the confident-but-subtly-wrong failure
 the ladder exists to catch. Neither model passes `word_wrap`; escalation is not
 magic, and that is what the human gate is for.
+
+That last sentence held until the acceptance contract. Given one, the **fast**
+model passes `word_wrap` on its first attempt, with no escalation and no human
+gate — because it was never the model that could not write the wrapper. It was
+the model that could not tell whether it had. Escalating to a bigger model is the
+right answer to *the code is wrong*; it is an expensive non-answer to *the test is
+wrong*, and the ladder cannot tell those apart on its own.
 
 ### Why the tier is sticky per task
 
@@ -197,6 +280,7 @@ scrutiny is warranted — the fast model has already failed it once.
 | `config.py` | every tuneable, and the workspace paths, resolved once |
 | `state.py` | `HiveState` — the shared TypedDict and its contract |
 | `prompts.py` | every system prompt, so a prompt change is a one-file diff |
+| `contract.py` | acceptance contracts: parse, path-match, and the import harness |
 | `orchestrator.py` | graph construction and `reviewer_logic` |
 | `cli.py` | REPL, sprint runner, and the single stdin broker |
 | `core/platform.py` | the Windows/Linux seam |
@@ -218,7 +302,12 @@ and documented in `state.py` because breaking them silently is easy:
 - `agent_router_node` never touches `editor_error`, and always resets
   `editor_retries` — it only runs at the start of a new task.
 - `semantic_reviewer_node` injects its FAIL verdict as `editor_error`, so the
-  rejection reuses the existing retry path.
+  rejection reuses the existing retry path. It stands down entirely (auto-PASS,
+  advance) when `contract_satisfied` is `True`.
+- `contracts` is read-only for every node; the entrypoint parses it once from the
+  objective. `contract_satisfied` is written only by `reviewer_node` and reset per
+  task by `agent_router_node` — a `True` left over from the previous file would
+  retire a task on the strength of a different file's passing grade.
 - `human_gate_node` clears `editor_error` and `current_task` so `reviewer_logic`
   routes to the retrospector after escalation.
 - `retrospector_node` deliberately leaves `editor_error` and `editor_retries`

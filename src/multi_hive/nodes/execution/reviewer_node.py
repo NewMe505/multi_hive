@@ -2,22 +2,37 @@
 reviewer_node — execution verification.
 
 Writes the generated file to the workspace, compiles it, then runs it in a
-sandboxed subprocess. Passing means the code both parses and survives its own
-asserts. Whether it is the *right* program is semantic_reviewer_node's problem.
+sandboxed subprocess.
 
-Sandboxing is strongest on POSIX, where core.platform supplies RLIMIT ceilings
-via preexec_fn. Windows has no fork and therefore no preexec_fn, so there the
-subprocess is bounded by timeout and a minimal environment only — see
-core/platform.py. On both platforms the environment is stripped of host
-secrets and the process cannot write outside the workspace.
+What "passing" means depends on who wrote the test.
+
+  Without a contract, the node runs the model's own script, and passing means
+  the code survives the asserts the model wrote about itself. That is the weakest
+  useful check there is, and it is weak in a specific, expensive way: the model
+  is judge and defendant. It has rejected its own correct code for failing an
+  assert that was impossible to satisfy — see contract.py.
+
+  With a human-supplied acceptance contract, the node IMPORTS the module and
+  executes the human's asserts against it. Passing then means the code does what
+  the person who asked for it said it must do. The model's own test code, if it
+  wrote any despite being told not to, never runs: an imported module's __name__
+  is not "__main__".
+
+Sandboxing is identical either way, and is strongest on POSIX, where
+core.platform supplies RLIMIT ceilings via preexec_fn. Windows has no fork and
+therefore no preexec_fn, so there the subprocess is bounded by a Job Object and
+a timeout — see core/platform.py. On both platforms the environment is stripped
+of host secrets and the process cannot write outside the workspace.
 """
 from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from multi_hive.config import SANDBOX_TIMEOUT_SEC, WORKSPACE_DIR, sandbox_env
+from multi_hive.contract import contract_for, render_harness
 from multi_hive.core.memory import log_rejection
 from multi_hive.core.platform import confine, release, sandbox_preexec
 from multi_hive.core.utils import flush_file, safe_path
@@ -25,10 +40,41 @@ from multi_hive.core.utils import flush_file, safe_path
 _MAX_OUTPUT_CHARS = 65536
 _MAX_TRACEBACK_CHARS = 1500
 
+_TIMEOUT_RC = 124  # conventional; distinct from any exit code the harness uses
 
-def _executes(loop_health: Any) -> dict[str, Any]:
+# The contract harness lives in the workspace, not the source tree: it is
+# generated, it is rewritten on every review, and it must be somewhere the
+# sandbox is allowed to read.
+_HARNESS_FILE = "outputs/.acceptance_harness.py"
+
+# Exit codes from contract.render_harness — each one tells the editor a different
+# thing, so each gets its own message rather than a generic "it failed".
+_CONTRACT_FAILURES: dict[int, str] = {
+    2: (
+        "ACCEPTANCE CONTRACT — YOUR MODULE FAILED TO IMPORT.\n"
+        "The contract never ran. Fix the code so the module imports cleanly:"
+    ),
+    3: (
+        "ACCEPTANCE CONTRACT VIOLATED — your code ran but produced the wrong "
+        "result. This assert was written by a human and is correct by definition; "
+        "the code is what is wrong. Fix the logic:"
+    ),
+    4: (
+        "ACCEPTANCE CONTRACT — MISSING NAME. The contract calls something your "
+        "module does not define. Check the exact spelling of every public "
+        "function and class:"
+    ),
+    5: (
+        "ACCEPTANCE CONTRACT — UNEXPECTED EXCEPTION while checking your code "
+        "(not an AssertionError). Fix the crash:"
+    ),
+    _TIMEOUT_RC: "ACCEPTANCE CONTRACT — TIMED OUT. The code did not terminate:",
+}
+
+
+def _executes(loop_health: Any, contract_satisfied: bool | None = None) -> dict[str, Any]:
     """
-    The code ran. That is ALL this node is entitled to say.
+    The code passed whatever check applied to it. That is ALL this node may say.
 
     It deliberately does not advance the task queue, clear current_task, or
     reset editor_retries. Declaring the task finished here is what broke the
@@ -39,19 +85,64 @@ def _executes(loop_health: Any) -> dict[str, Any]:
     re-validating identical code. Observed in the wild: 992 identical semantic
     rejections, zero escalations.
 
-    A task is finished when BOTH reviewers pass, and only semantic_reviewer_node
-    is in a position to know that. Advancement lives there now.
+    A task is finished when every gate has passed, and only the last gate is in a
+    position to know that. Advancement lives in semantic_reviewer_node.
     """
-    return {"editor_error": None, "loop_health": loop_health}
+    return {
+        "editor_error": None,
+        "loop_health": loop_health,
+        "contract_satisfied": contract_satisfied,
+    }
 
 
-def _fail(state: dict[str, Any], loop_health: Any, error_msg: str) -> dict[str, Any]:
+def _fail(
+    state: dict[str, Any],
+    loop_health: Any,
+    error_msg: str,
+    contract_satisfied: bool | None = None,
+) -> dict[str, Any]:
     log_rejection("reviewer_node", error_msg)
     return {
         "editor_error": error_msg,
         "editor_retries": state.get("editor_retries", 0) + 1,
         "loop_health": loop_health,
+        "contract_satisfied": contract_satisfied,
     }
+
+
+def _run_sandboxed(script: Path) -> tuple[int, str]:
+    """
+    Run `script` in the sandbox. Returns (returncode, combined output).
+
+    Two halves of one sandbox: preexec_fn applies RLIMITs between fork and exec
+    on POSIX; confine() assigns the child to a Job Object on Windows, which has
+    no fork. See core/platform.py for what each actually enforces.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=sandbox_env(),
+        cwd=str(WORKSPACE_DIR),
+        preexec_fn=sandbox_preexec(),
+    )
+    job = confine(proc.pid)
+
+    try:
+        out_bytes, _ = proc.communicate(timeout=SANDBOX_TIMEOUT_SEC)
+        return proc.returncode, out_bytes.decode("utf-8", errors="replace")[:_MAX_OUTPUT_CHARS]
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out_bytes, _ = proc.communicate()
+        output = (
+            out_bytes.decode("utf-8", errors="replace")[:_MAX_OUTPUT_CHARS]
+            + f"\nTIMEOUT: Execution exceeded {SANDBOX_TIMEOUT_SEC}s."
+        )
+        return _TIMEOUT_RC, output
+    finally:
+        # The job is KILL_ON_JOB_CLOSE, so this must not run before communicate()
+        # returns — closing it early would kill a perfectly healthy sandbox run.
+        release(job)
 
 
 def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -81,42 +172,42 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
     if syntax_check.returncode != 0:
         return _fail(state, loop_health, "SYNTAX ERROR:\n" + syntax_check.stderr)
 
+    contract = contract_for(state.get("contracts") or {}, active_file)
+
     # ── UI tasks skip execution: the window would block forever ──────────────
-    if state.get("is_ui_task"):
+    #
+    # A contract still runs, because importing a module does not open a window —
+    # that is what the Controller/View split in the editor prompt is for. Only
+    # the *script* is unsafe to execute here.
+    if state.get("is_ui_task") and not contract:
         return _executes(loop_health)
 
-    # ── Sandboxed execution ───────────────────────────────────────────────────
-    # Two halves of one sandbox: preexec_fn applies RLIMITs between fork and exec
-    # on POSIX; confine() assigns the child to a Job Object on Windows, which has
-    # no fork. See core/platform.py for what each actually enforces.
-    proc = subprocess.Popen(
-        [sys.executable, str(impl_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=sandbox_env(),
-        cwd=str(WORKSPACE_DIR),
-        preexec_fn=sandbox_preexec(),
-    )
-    job = confine(proc.pid)
+    # ── Contract mode: the human's asserts, against an imported module ────────
+    if contract:
+        try:
+            harness_path = flush_file(_HARNESS_FILE, render_harness(str(impl_path), contract))
+        except Exception as e:
+            return _fail(state, loop_health, f"FILE SYSTEM ERROR (contract harness): {e}")
 
-    try:
-        out_bytes, _ = proc.communicate(timeout=SANDBOX_TIMEOUT_SEC)
-        output = out_bytes.decode("utf-8", errors="replace")[:_MAX_OUTPUT_CHARS]
-        passed = proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out_bytes, _ = proc.communicate()
-        output = (
-            out_bytes.decode("utf-8", errors="replace")[:_MAX_OUTPUT_CHARS]
-            + f"\nTIMEOUT: Execution exceeded {SANDBOX_TIMEOUT_SEC}s."
+        code, output = _run_sandboxed(harness_path)
+
+        if code == 0:
+            return _executes(loop_health, contract_satisfied=True)
+
+        headline = _CONTRACT_FAILURES.get(
+            code, "ACCEPTANCE CONTRACT — the check exited unexpectedly:"
         )
-        passed = False
-    finally:
-        # The job is KILL_ON_JOB_CLOSE, so this must not run before communicate()
-        # returns — closing it early would kill a perfectly healthy sandbox run.
-        release(job)
+        return _fail(
+            state,
+            loop_health,
+            f"{headline}\n{output[-_MAX_TRACEBACK_CHARS:]}",
+            contract_satisfied=False,
+        )
 
-    if passed:
+    # ── No contract: run the model's own script and trust its own asserts ─────
+    code, output = _run_sandboxed(impl_path)
+
+    if code == 0:
         return _executes(loop_health)
 
     return _fail(state, loop_health, "TRACEBACK:\n" + output[-_MAX_TRACEBACK_CHARS:])

@@ -37,6 +37,71 @@ Then type an objective at the prompt:
 [USER_OBJECTIVE] > Build a DSP pipeline with a sine generator and a delay effect. Save it to outputs/dsp_pipeline.py
 ```
 
+Or hand it an objective file — which is how you supply an acceptance contract:
+
+```bash
+multi-hive --objective examples/wrap_text.md
+```
+```
+[USER_OBJECTIVE] > @examples/wrap_text.md
+```
+
+## Acceptance contracts — tell it what "correct" means
+
+By default the editor writes the implementation **and** the asserts that judge
+it. That is a conflict of interest, and it has a measured cost. Asked to wrap
+text at a width of 10, the model wrote:
+
+```python
+assert wrap_text("hello world", 10) == ["hello world"]
+```
+
+Eleven characters into a width of ten. Its implementation was correct; its
+assert was impossible. So it rejected its own working code, burned the retry
+budget, escalated to the strong model, and woke a human. Nothing was wrong with
+the program.
+
+The missing information — what *correct* means — is not in the model. It is in
+you. So you write it:
+
+```
+Implement wrap_text(text, width) which greedily wraps text into lines of at most
+`width` characters. A word longer than `width` is hard-split. Runs of spaces
+collapse.
+
+Save it to outputs/wrap.py
+
+ACCEPTANCE outputs/wrap.py
+assert wrap_text("one two three", 7) == ["one two", "three"]
+assert wrap_text("supercalifragilistic", 6) == ["superc", "alifra", "gilist", "ic"]
+assert wrap_text("a  b", 4) == ["a b"]
+```
+
+Everything before the `ACCEPTANCE` header is the objective. The block after it is
+the contract. When a file has one:
+
+1. The editor is told to write **no asserts at all** — the contract is the test.
+2. `reviewer_node` **imports** the module and runs your asserts against it. Any
+   test code the model wrote anyway is dead: an imported module's `__name__` is
+   not `"__main__"`.
+3. `semantic_reviewer_node` stands down. Your executable contract is a stronger
+   check than a 7B model asked "is this the right program?", and that reviewer is
+   the other source of false rejections.
+
+A violated assert routes through the normal retry and escalation ladder — but now
+the loop is being fed ground truth instead of the model's opinion of itself.
+
+A bare `ACCEPTANCE` with no path applies to whichever file the task produces. A
+contract that doesn't compile is rejected at the prompt, not forty seconds into a
+doomed sprint. Contracts are never truncated by `HIVE_MAX_INPUT_CHARS` — trimming
+prose is lossy, trimming a contract is a correctness bug.
+
+**On gaming.** The editor sees the contract, so it could hardcode against it. The
+prompt forbids it, and the benchmark checks: `bench/contracts.py` deliberately
+uses different literal values than the hidden test suites, so code that memorises
+the contract passes the contract and *fails the bench*. `--contract` shouts
+`[CONTRACT GAMED]` if that ever happens.
+
 ## Layout
 
 ```
@@ -44,6 +109,7 @@ src/multi_hive/
 ├── config.py          all tuneables + the workspace paths, resolved once
 ├── state.py           HiveState — the shared LangGraph TypedDict
 ├── prompts.py         every system prompt, in one reviewable place
+├── contract.py        human-written acceptance contracts: parse, match, harness
 ├── orchestrator.py    the graph: nodes, edges, and reviewer_logic routing
 ├── cli.py             REPL, sprint runner, stdin broker
 ├── core/
@@ -59,7 +125,7 @@ src/multi_hive/
     ├── ticket_writer.py          plan       → JSON task queue
     ├── agent_router_node.py      injects domain rules, resets per-task state
     ├── async_editor_node.py      generates code; fingerprints repeat errors
-    ├── reviewer_node.py          does it RUN?      (sandboxed subprocess)
+    ├── reviewer_node.py          does it RUN? / does it satisfy the contract?
     ├── semantic_reviewer_node.py is it the RIGHT program? (adversarial LLM)
     ├── human_gate_node.py        escalation interrupt
     └── retrospector_node.py      backfill, metrics, LOOP.md
@@ -109,7 +175,8 @@ Every tuneable is an environment variable — see `config.py`.
 - **Two reviewers.** `reviewer_node` proves the code *runs*. It cannot prove
   the code is the program that was asked for, so `semantic_reviewer_node`
   re-reads the task adversarially and rejects code that runs cleanly while
-  implementing the wrong thing.
+  implementing the wrong thing. Both are guesses about intent, and both can guess
+  wrong — which is what an **acceptance contract** replaces when you supply one.
 - **Rejection ledger.** Every failure is logged and fed back into the next
   prompt, split into three feeds — generation, runtime, semantic — because
   each implies a different fix. Merging them produces incoherent retries.
@@ -152,16 +219,23 @@ does not spell out, because clean-and-confidently-wrong is the failure that
 matters.
 
 ```bash
-python scripts/bench.py sprint          # the full hive, end to end
-python scripts/bench.py models          # raw models, no graph
-python scripts/bench.py history         # the trend, run by run
-python scripts/bench.py sprint --check  # exit 1 on a regression
+python scripts/bench.py sprint             # the full hive, end to end
+python scripts/bench.py sprint --contract  # ...with human-written acceptance contracts
+python scripts/bench.py models             # raw models, no graph
+python scripts/bench.py history            # the trend, run by run
+python scripts/bench.py sprint --check     # exit 1 on a regression
 ```
 
 **`sprint` is the one to track.** It drives the real graph — planner, tickets,
 editor, both reviewers, the retry loop, the escalation ladder — and grades the
 file that actually lands on disk. A change that improves the prompts but breaks
 the router looks perfect to `models` and terrible here.
+
+`--contract` is recorded under a **separate subject** (`hive+contract`), so it
+never shares a baseline with a plain run. The two ask different questions — plain
+asks *can the hive guess what I meant*, contract asks *when I say exactly what I
+want, does it deliver* — and comparing the two scores to each other means
+nothing. Comparing each to its own history means everything.
 
 Every run is recorded against the current git commit in
 `workspace/outputs/bench_history.jsonl`, so a regression can be traced to the

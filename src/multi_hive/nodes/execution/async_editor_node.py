@@ -21,6 +21,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from multi_hive import prompts
+from multi_hive.contract import contract_for
 from multi_hive.core.ast_utils import get_code_outline
 from multi_hive.core.llm_factory import get_async_llm, invalidate_llm, model_for
 from multi_hive.core.memory import get_recent_rejections, log_rejection
@@ -126,12 +127,20 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     # Three separate failure feeds — the editor must know *which kind* of
     # failure it is fixing. Semantic rejections in particular were invisible
     # here once, and the model reproduced identical code until escalation.
+    #
+    # The contract, when there is one, is handed to the editor deliberately. It
+    # is the spec: hiding it would be asking the model to guess the very thing
+    # the human just took the trouble to write down. The risk that it hardcodes
+    # against the literals is real, and it is answered with a prompt rule and a
+    # benchmark that can actually detect it — not by withholding the spec. See
+    # contract.py and bench/contracts.py.
     sys_prompt = prompts.get_editor_prompt(
         global_objective,
         state.get("specialist_context", ""),
         get_recent_rejections("async_editor_node"),
         get_recent_rejections("reviewer_node"),
         get_recent_rejections("semantic_reviewer_node"),
+        acceptance_contract=contract_for(state.get("contracts") or {}, active_file),
     )
 
     # Full text for the active file; signature outlines for everything else.
