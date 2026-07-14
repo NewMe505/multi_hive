@@ -92,3 +92,47 @@ class TestLlmFactoryTiers:
 
         with pytest.raises(ValueError, match="Unknown LLM purpose"):
             llm_factory._resolve("astrologer", "fast")
+
+
+# ── HIVE_PLAN_TIER — who decides what the task IS ────────────────────────────
+
+
+def test_plan_tier_defaults_to_the_router():
+    """Unset means no behaviour change: the router classifies the objective."""
+    from multi_hive.core import model_router
+    from multi_hive.core.model_router import FAST, STRONG, select_plan_tier
+
+    assert model_router.PLAN_TIER == ""  # not set in the test env
+    assert select_plan_tier("write a function that adds two numbers") == FAST
+    assert select_plan_tier("refactor the parser to be thread-safe") == STRONG
+
+
+def test_plan_tier_pins_the_planner_and_ticket_writer(monkeypatch):
+    """
+    The plan and the tickets decide what the task IS. Everything downstream is
+    executing that paraphrase, and a bad ticket cannot be rescued by escalating
+    the editor — the editor is faithfully building the wrong thing.
+
+    There is no retry ladder here to climb out of it either: by the time the editor
+    fails, the ticket it is failing against has already been written.
+    """
+    from multi_hive.core import model_router
+    from multi_hive.core.model_router import STRONG, select_plan_tier
+
+    monkeypatch.setattr(model_router, "PLAN_TIER", STRONG)
+    # A trivial objective the router would otherwise send to the fast model.
+    assert select_plan_tier("write a function that adds two numbers") == STRONG
+
+
+def test_force_tier_still_outranks_plan_tier(monkeypatch):
+    """
+    HIVE_FORCE_TIER exists so a benchmark can pin every tier. A benchmark silently
+    un-pinned by a routing rule is not a benchmark, so PLAN_TIER does not get to
+    outrank it — the same rule tier_floor already lives under.
+    """
+    from multi_hive.core import model_router
+    from multi_hive.core.model_router import FAST, STRONG, select_plan_tier
+
+    monkeypatch.setattr(model_router, "FORCE_TIER", FAST)
+    monkeypatch.setattr(model_router, "PLAN_TIER", STRONG)
+    assert select_plan_tier("anything at all") == FAST

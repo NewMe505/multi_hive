@@ -19,7 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from multi_hive import prompts
 from multi_hive.core.llm_factory import get_llm
-from multi_hive.core.model_router import classify_complexity, select_tier
+from multi_hive.core.model_router import select_plan_tier
 
 
 def sprint_planner(state: dict[str, Any]) -> dict[str, Any]:
@@ -28,10 +28,11 @@ def sprint_planner(state: dict[str, Any]) -> dict[str, Any]:
     human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
     objective = human_msgs[0].content if human_msgs else ""
 
-    # Classified from the objective — the human's own words, before anything has
-    # summarised them. There is no ticket to read yet, which is exactly why this
-    # is the honest place to judge how hard the work is.
-    tier = select_tier(classify_complexity(objective))
+    # Routed from the objective — the human's own words, before anything has
+    # summarised them. There is no ticket to read yet, which is exactly what makes
+    # this the honest place to judge the work. HIVE_PLAN_TIER pins it; see
+    # select_plan_tier for why this is a different decision from select_tier.
+    tier = select_plan_tier(objective)
 
     response = get_llm("planner", tier).invoke(
         [

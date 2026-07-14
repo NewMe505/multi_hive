@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from multi_hive import prompts
 from multi_hive.core.llm_factory import get_llm
 from multi_hive.core.memory import log_rejection
-from multi_hive.core.model_router import STRONG, classify_complexity, select_tier
+from multi_hive.core.model_router import STRONG, select_plan_tier
 from multi_hive.core.utils import normalise_model_path
 
 
@@ -182,10 +182,10 @@ def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
     # the tickets were always written by the 7B, and the 7B decides what the task
     # IS. Everything downstream is executing its paraphrase.
     #
-    # Complexity is read from the OBJECTIVE. There is no ticket yet to read it
-    # from, which is the point — this is the one node that still has the human's
-    # own words, before anything has summarised them.
-    tier = select_tier(classify_complexity(user_objective))
+    # Routed from the OBJECTIVE, because there is no ticket yet to route from —
+    # which is the point. HIVE_PLAN_TIER=strong pins this node and the planner to
+    # the good model; see select_plan_tier for why that is worth considering.
+    tier = select_plan_tier(user_objective)
 
     response = get_llm("ticket", tier).invoke(messages)
     tasks = _extract_task_list(response.content)
