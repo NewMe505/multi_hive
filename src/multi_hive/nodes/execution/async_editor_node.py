@@ -277,25 +277,42 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
             f"means. Where they disagree, this wins:{newline}{global_objective}"
         )
 
-    # The FILE ANCHOR, and it must come after the objective.
+    # The FILE ANCHOR — after the objective, and ONLY when the sprint has more than
+    # one file.
     #
-    # Putting the requirement last is right — it carries the traps a ticket-writer's
+    # Putting the requirement last is right: it carries the traps a ticket-writer's
     # paraphrase drops. But an objective can describe MORE THAN ONE FILE, and once it
-    # became the terminal instruction it took the file selection with it.
+    # became the terminal instruction it took the file selection with it. word_stats
+    # asks for two modules and names tokens.py first; handed a ticket for stats.py and
+    # then told to read a two-file spec as its final word, the editor wrote tokens.py —
+    # into stats.py. The file on disk opened with `# outputs/tokens.py` and defined
+    # tokenize(). Every run. 3/3 -> 0/3.
     #
-    # word_stats asks for two modules and names tokens.py first. The editor, handed a
-    # ticket for stats.py and then told to read a two-file spec as its final word,
-    # wrote tokens.py — into stats.py. The file on disk opened with the comment
-    # `# outputs/tokens.py` and defined tokenize(). Every run. 3/3 -> 0/3.
+    # So the anchor goes last. But it is a paragraph about file selection, and the last
+    # slot is the one the model weights most — an UNCONDITIONAL anchor spent it on a
+    # warning about files that do not exist, and semver and word_wrap each lost a run,
+    # in BOTH contract and plain mode. Those are precisely the two trap tasks the
+    # objective-last change rescued. Displacing the requirement from the terminal slot
+    # de-weights it, which is the same mechanism as the original bug, pointed the other
+    # way.
     #
-    # The requirement says what correct means. It does not say which file this call is
-    # for; the ticket does, and that fact has to survive to the end of the prompt.
-    user_prompt += (
-        f"{newline}{newline}YOU ARE WRITING EXACTLY ONE FILE: {active_file}{newline}"
-        f"The requirement above may describe several files. The others are written by "
-        f"separate calls — do NOT write them here. Output ONLY the full contents of "
-        f"{active_file}."
+    # The anchor exists to disambiguate WHICH file. With one file there is nothing to
+    # disambiguate, so it is not worth the slot — the requirement keeps it.
+    sprint_files = {active_file}
+    sprint_files.update(project_files)
+    sprint_files.update(
+        t["file"]
+        for t in (state.get("task_queue") or [])
+        if isinstance(t, dict) and t.get("file")
     )
+
+    if len(sprint_files) > 1:
+        user_prompt += (
+            f"{newline}{newline}YOU ARE WRITING EXACTLY ONE FILE: {active_file}{newline}"
+            f"The requirement above describes several files. The others are written by "
+            f"separate calls — do NOT write them here. Output ONLY the full contents of "
+            f"{active_file}."
+        )
 
     # ── Generation ────────────────────────────────────────────────────────────
     try:

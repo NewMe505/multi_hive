@@ -123,7 +123,36 @@ def test_the_editor_gets_the_requirement_verbatim_and_last():
     assert user.rindex("Ties are broken") > user.rindex("EXECUTE THIS SPECIFIC TASK")
 
 
-def test_the_file_anchor_outranks_the_objective():
+def _run_editor(state: dict) -> str:
+    """Run the editor against a fake LLM and return the user prompt it sent."""
+    import asyncio
+    from unittest.mock import patch
+
+    from multi_hive.nodes.execution import async_editor_node as mod
+
+    captured: dict = {}
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            captured["user"] = messages[-1].content
+            return type("R", (), {"content": "```python\nx = 1\n```"})()
+
+    with patch.object(mod, "get_async_llm", lambda *a, **k: _FakeLLM()):
+        asyncio.run(mod.async_editor_node(state))
+
+    return captured["user"]
+
+
+# The real two-file objective, in the order that broke it: tokens.py named FIRST.
+_TWO_FILE_OBJECTIVE = (
+    "Implement a two-module word-frequency tool.\n"
+    "outputs/tokens.py defines: tokenize(text) -> list[str]\n"
+    "outputs/stats.py defines: top_words(text, n) -> list[tuple[str, int]]\n"
+    "stats.py MUST import tokenize from tokens.py."
+)
+
+
+def test_a_multi_file_sprint_anchors_the_file_after_the_objective():
     """
     An objective can describe MORE THAN ONE FILE, and moving it last took the file
     selection with it.
@@ -132,85 +161,90 @@ def test_the_file_anchor_outranks_the_objective():
     stats.py and then told to read a two-file spec as its final word, the editor wrote
     tokens.py INTO stats.py — the file on disk opened with `# outputs/tokens.py` and
     defined tokenize(). Every run. 3/3 -> 0/3.
-
-    The requirement says what correct means. The ticket says which file this call is
-    for, and that fact has to survive to the end of the prompt.
     """
-    import asyncio
-    from unittest.mock import patch
-
     from langchain_core.messages import HumanMessage
 
-    from multi_hive.nodes.execution import async_editor_node as mod
-
-    captured: dict = {}
-
-    class _FakeLLM:
-        async def ainvoke(self, messages):
-            captured["user"] = messages[-1].content
-            return type("R", (), {"content": "```python\nx = 1\n```"})()
-
-    # The real two-file objective, in the order that broke it: tokens.py FIRST.
-    objective = (
-        "Implement a two-module word-frequency tool.\n"
-        "outputs/tokens.py defines: tokenize(text) -> list[str]\n"
-        "outputs/stats.py defines: top_words(text, n) -> list[tuple[str, int]]\n"
-        "stats.py MUST import tokenize from tokens.py."
+    user = _run_editor(
+        {
+            "current_task": "implement top_words",
+            "active_file": "outputs/stats.py",
+            "messages": [HumanMessage(content=_TWO_FILE_OBJECTIVE)],
+            "project_files": {},
+            # The sibling ticket is still queued — this is what makes it multi-file.
+            "task_queue": [{"file": "outputs/tokens.py", "task": "implement tokenize"}],
+        }
     )
-
-    with patch.object(mod, "get_async_llm", lambda *a, **k: _FakeLLM()):
-        asyncio.run(
-            mod.async_editor_node(
-                {
-                    "current_task": "implement top_words",
-                    "active_file": "outputs/stats.py",
-                    "messages": [HumanMessage(content=objective)],
-                    "project_files": {},
-                }
-            )
-        )
-
-    user = captured["user"]
 
     # The requirement still reaches the model, and still comes after the ticket.
     assert "MUST import tokenize" in user
     assert user.rindex("MUST import tokenize") > user.rindex("EXECUTE THIS SPECIFIC TASK")
 
-    # But the FILE is the last word — after the objective, not before it.
+    # ...but the FILE gets the last word, because there are two of them to confuse.
     assert "YOU ARE WRITING EXACTLY ONE FILE: outputs/stats.py" in user
     assert user.rindex("YOU ARE WRITING EXACTLY ONE FILE") > user.rindex("MUST import tokenize")
 
 
-def test_the_file_anchor_survives_contract_mode():
-    """The anchor is appended after BOTH branches, not just the plain one."""
-    import asyncio
-    from unittest.mock import patch
-
+def test_a_multi_file_sprint_sees_the_anchor_from_an_already_written_sibling():
+    """
+    The second ticket has an EMPTY queue — the sibling is already in project_files.
+    Deriving multi-file-ness from the queue alone would drop the anchor on exactly the
+    call that needs it most: the one writing stats.py while tokens.py exists.
+    """
     from langchain_core.messages import HumanMessage
 
-    from multi_hive.nodes.execution import async_editor_node as mod
+    user = _run_editor(
+        {
+            "current_task": "implement top_words",
+            "active_file": "outputs/stats.py",
+            "messages": [HumanMessage(content=_TWO_FILE_OBJECTIVE)],
+            "project_files": {"outputs/tokens.py": "def tokenize(t): ..."},
+            "task_queue": [],
+        }
+    )
 
-    captured: dict = {}
+    assert "YOU ARE WRITING EXACTLY ONE FILE: outputs/stats.py" in user
 
-    class _FakeLLM:
-        async def ainvoke(self, messages):
-            captured["user"] = messages[-1].content
-            return type("R", (), {"content": "```python\nx = 1\n```"})()
 
-    with patch.object(mod, "get_async_llm", lambda *a, **k: _FakeLLM()):
-        asyncio.run(
-            mod.async_editor_node(
-                {
-                    "current_task": "implement top_words",
-                    "active_file": "outputs/stats.py",
-                    "messages": [HumanMessage(content="outputs/tokens.py defines tokenize")],
-                    "project_files": {},
-                    "contracts": {"outputs/stats.py": "assert top_words('a', 1) == [('a', 1)]"},
-                }
-            )
-        )
+def test_a_single_file_sprint_leaves_the_requirement_last():
+    """
+    The anchor exists to disambiguate WHICH file. With one file there is nothing to
+    disambiguate — and the last slot is the one the model weights most heavily.
 
-    user = captured["user"]
+    Spending it unconditionally on a warning about files that do not exist cost semver
+    and word_wrap a run each, in BOTH contract and plain mode: they are precisely the
+    two trap tasks that putting the requirement last had rescued. So on a single-file
+    sprint the requirement keeps the terminal slot.
+    """
+    from langchain_core.messages import HumanMessage
+
+    user = _run_editor(
+        {
+            "current_task": "implement top_words",
+            "active_file": "outputs/stats.py",
+            "messages": [HumanMessage(content="Ties are broken alphabetically.")],
+            "project_files": {},
+            "task_queue": [],
+        }
+    )
+
+    assert "YOU ARE WRITING EXACTLY ONE FILE" not in user
+    assert user.rstrip().endswith("Ties are broken alphabetically.")
+
+
+def test_the_file_anchor_survives_contract_mode():
+    """The anchor is appended after BOTH branches, not just the plain one."""
+    from langchain_core.messages import HumanMessage
+
+    user = _run_editor(
+        {
+            "current_task": "implement top_words",
+            "active_file": "outputs/stats.py",
+            "messages": [HumanMessage(content=_TWO_FILE_OBJECTIVE)],
+            "project_files": {"outputs/tokens.py": "def tokenize(t): ..."},
+            "contracts": {"outputs/stats.py": "assert top_words('a', 1) == [('a', 1)]"},
+        }
+    )
+
     assert "YOU ARE WRITING EXACTLY ONE FILE: outputs/stats.py" in user
     # ...and the contract is still the judge in contract mode — the anchor does not
     # reintroduce the authority contradiction that gamed word_wrap.
