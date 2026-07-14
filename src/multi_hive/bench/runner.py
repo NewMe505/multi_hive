@@ -26,6 +26,7 @@ import requests
 from multi_hive.bench.suite import Task, grade
 from multi_hive.config import OUTPUTS_DIR, RECURSION_LIMIT, SRC_DIR, ensure_workspace
 from multi_hive.contract import normalise_target
+from multi_hive.core import governor
 from multi_hive.core.memory import clear_ledger
 from multi_hive.prompts import get_editor_prompt
 
@@ -271,6 +272,7 @@ def run_model(model: str, task: Task, num_ctx: int = 4096, num_predict: int = 20
 
     wall = time.perf_counter() - started
     tokens = final.get("eval_count", 0)
+    prompt_tokens = final.get("prompt_eval_count", 0)
     eval_ns = final.get("eval_duration", 0)
 
     result = grade(_extract_files("".join(chunks), task), task)
@@ -283,6 +285,13 @@ def run_model(model: str, task: Task, num_ctx: int = 4096, num_predict: int = 20
         "wall_sec": round(wall, 2),
         "tok_per_sec": round(tokens / (eval_ns / 1e9), 1) if eval_ns and tokens else 0.0,
         "output_tokens": tokens,
+        # Input tokens too, so the sprint suite and the models suite can be compared
+        # on COST and not just on score. A pipeline that scores one task higher while
+        # burning ten times the tokens has not obviously won, and until now the
+        # benchmark had no way to say so.
+        "input_tokens": prompt_tokens,
+        "total_tokens": prompt_tokens + tokens,
+        "attempts": 1,  # one shot, by definition — the baseline for `attempts` below
         "gpu_placement": gpu_placement(model),
     }
 
@@ -346,6 +355,47 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
     error: str | None = None
     contract_satisfied: bool | None = None
 
+    # Bracket the sprint so we can say what it COST, not just what it scored.
+    spend_before = governor.current().snapshot()
+
+    # ── Every candidate the editor produced, graded ───────────────────────────
+    #
+    # The benchmark only ever graded the LAST file on disk. So it could not see the
+    # single most important thing this pipeline does to itself:
+    #
+    #     the editor writes correct code -> a reviewer falsely rejects it
+    #     -> a retry overwrites it with something worse -> the bench grades the loser
+    #
+    # That is not a hypothetical. async_editor_node clobbers project_files[active_file]
+    # unconditionally and reviewer_node flushes it to disk, so a correct attempt #1 is
+    # PHYSICALLY OVERWRITTEN by a worse attempt #2. Every false rejection is therefore
+    # not merely wasted time — it is an active downgrade of the artefact, and the
+    # score alone cannot distinguish "the model could not do it" from "the model did
+    # it and we threw it away".
+    #
+    # So: grade each distinct version of the graded file as the editor emits it.
+    # Cheap (a subprocess, ~0.3s, a handful per sprint) and it turns an invisible
+    # failure mode into a number. Measure it BEFORE fixing it — otherwise there is no
+    # way to know whether the fix paid.
+    candidates: list[bool] = []
+    seen: set[int] = set()
+
+    def _grade_candidate(files: dict[str, str]) -> None:
+        code = files.get(target, "")
+        if not code.strip():
+            return
+        fingerprint = hash(code)
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        # The siblings a multi-file task needs come off disk — the editor writes one
+        # file at a time, and an earlier ticket's file is already flushed.
+        payload = {task.filename: code}
+        for name in task.extra_files:
+            path = OUTPUTS_DIR / name
+            payload[name] = path.read_text(encoding="utf-8") if path.exists() else ""
+        candidates.append(grade(payload, task).passed)
+
     try:
         async for output in hive_app.astream(
             initial, config={"recursion_limit": RECURSION_LIMIT}
@@ -353,6 +403,8 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
             for _node, delta in output.items():
                 nodes += 1
                 delta = delta or {}
+                if delta.get("project_files"):
+                    _grade_candidate(delta["project_files"])
                 if delta.get("model_tier") and delta["model_tier"] not in tiers:
                     tiers.append(delta["model_tier"])
                 if "loop_health" in delta:
@@ -382,6 +434,22 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
         for name in task.files
     }
     result = grade(files, task)
+    spend = governor.spend_since(spend_before)
+
+    # The three numbers the score cannot tell you.
+    #
+    # attempts               — how many distinct files the editor produced. 1 means it
+    #                          got it right (or wrong) first time; 3 means it thrashed.
+    # first_attempt_passed   — did the very first thing it wrote already pass? A system
+    #                          that passes after three retries is not the same system as
+    #                          one that passes immediately, and the score cannot see the
+    #                          difference.
+    # discarded_a_pass       — THE one. The editor produced code that PASSES THE HIDDEN
+    #                          SUITE, and the sprint then shipped something else. That is
+    #                          the pipeline destroying a correct answer with its own
+    #                          reviewers, and it is invisible to every metric this
+    #                          benchmark had.
+    passed_ever = any(candidates)
 
     return {
         "task": task.name,
@@ -393,6 +461,13 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
         "tiers": tiers,           # ["fast"] or ["fast", "strong"] — did it escalate?
         "escalated_to_human": escalated,
         "wrote_artefact": bool(files.get(task.filename)),
+        "attempts": len(candidates),
+        "first_attempt_passed": bool(candidates and candidates[0]),
+        "discarded_a_pass": bool(passed_ever and not result.passed),
+        "input_tokens": spend.get("input_tokens", 0),
+        "output_tokens": spend.get("output_tokens", 0),
+        "total_tokens": spend.get("total_tokens", 0),
+        "usd": spend.get("usd", 0.0),
         # The gaming detector. In contract mode, contract_satisfied=True with
         # passed=False means the code cleared the human's asserts and failed the
         # hidden ones — which is what memorising the contract's literal inputs

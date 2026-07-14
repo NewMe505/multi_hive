@@ -321,6 +321,15 @@ def _aggregate(results: dict[str, list[dict]], contract: bool, repeat: int) -> h
                 "nodes": statistics.median([r["nodes"] for r in runs]),
                 "tiers": runs[0]["tiers"],
                 "escalated_to_human": any(r["escalated_to_human"] for r in runs),
+                # The story metrics. See bench/runner.run_sprint for what each is, and
+                # why the score alone cannot tell you.
+                "attempts": statistics.median([r.get("attempts", 0) for r in runs]),
+                "first_attempt_passed": all(r.get("first_attempt_passed") for r in runs),
+                # ANY run that produced a passing file and then shipped something else.
+                # `any`, not `all`: destroying a correct answer even once is the finding.
+                "discarded_a_pass": any(r.get("discarded_a_pass") for r in runs),
+                "total_tokens": statistics.median([r.get("total_tokens", 0) for r in runs]),
+                "usd": round(statistics.median([r.get("usd", 0.0) for r in runs]), 6),
                 # all(), not any() — it must aggregate the same way `passed` does.
                 #
                 # With any(), a row could read contract_satisfied=True, passed=False
@@ -372,6 +381,64 @@ def _aggregate(results: dict[str, list[dict]], contract: bool, repeat: int) -> h
 # ── Reporting ─────────────────────────────────────────────────────────────────
 
 
+def _story(run: history.Run) -> None:
+    """
+    The numbers the score cannot tell you.
+
+    "9/9 passed" was the whole report, and it hides everything that matters about
+    HOW. Two systems can both score 9/9 while one gets it right first time for 4k
+    tokens and the other thrashes through three retries and 40k. Only one of those
+    is good, and this benchmark could not tell them apart.
+
+    Four numbers. Each exists because a real finding was invisible without it:
+
+    COST      Tokens, and dollars on a paid provider. The pipeline can only be said
+              to beat a one-shot prompt if you know what it SPENT doing so. A system
+              that scores one task higher while burning ten times the tokens has not
+              obviously won.
+
+    1st-TRY   How often the first file the editor wrote already passed. A system that
+              passes after three retries is not the same system as one that passes
+              immediately, and `passed` cannot see the difference.
+
+    THRASH    Median editor attempts. 1.0 means it wrote the answer. 3.0 means it
+              argued with itself.
+
+    DISCARDED The one that matters most, and the one that was completely invisible.
+              The editor produced code that PASSES THE HIDDEN SUITE, and the sprint
+              shipped something else — a reviewer rejected a correct answer and a
+              retry overwrote it. The bench only ever graded the last file on disk,
+              so the pipeline could destroy its own correct work and score it as "the
+              model could not do it". Any number above zero here is a bug with a name
+              (best-attempt retention), not a mystery.
+    """
+    tasks = [t for t in run.tasks if "attempts" in t]
+    if not tasks:
+        return
+
+    tokens = sum(t.get("total_tokens", 0) or 0 for t in tasks)
+    usd = sum(t.get("usd", 0.0) or 0.0 for t in tasks)
+    first = sum(1 for t in tasks if t.get("first_attempt_passed"))
+    thrash = statistics.median([t.get("attempts", 0) or 0 for t in tasks])
+    discarded = [t["task"] for t in tasks if t.get("discarded_a_pass")]
+    passed = run.passed or 1  # a 0-pass run's tokens-per-pass is meaningless anyway
+
+    cost = f"${usd:.4f}" if usd else "free"
+    print(
+        f"  {DIM}tokens {tokens:,} ({tokens // passed:,}/pass, {cost})   "
+        f"1st-try {first}/{len(tasks)}   thrash {thrash:.1f} attempts{RESET}"
+    )
+
+    if discarded:
+        print(
+            f"  {RED}{BOLD}DISCARDED A PASSING ANSWER on {', '.join(discarded)}{RESET}\n"
+            f"  {DIM}The editor wrote code that passes the hidden suite, and the sprint "
+            f"shipped something else.\n  A reviewer rejected a correct answer and a "
+            f"retry overwrote it — the pipeline destroying\n  its own work. See the "
+            f"audit finding on best-attempt retention.{RESET}"
+        )
+
+
 def report(runs: list[history.Run], check: bool) -> int:
     exit_code = 0
 
@@ -379,6 +446,7 @@ def report(runs: list[history.Run], check: bool) -> int:
         print(f"\n{BOLD}{run.subject}{RESET}  {run.passed}/{run.total} passed  "
               f"{run.wall:.0f}s total  {DIM}@ {run.commit}"
               f"{' (dirty)' if run.dirty else ''}{RESET}")
+        _story(run)
 
         baseline = history.baseline_for(run)
         if not baseline:
