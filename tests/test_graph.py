@@ -123,6 +123,101 @@ def test_the_editor_gets_the_requirement_verbatim_and_last():
     assert user.rindex("Ties are broken") > user.rindex("EXECUTE THIS SPECIFIC TASK")
 
 
+def test_the_file_anchor_outranks_the_objective():
+    """
+    An objective can describe MORE THAN ONE FILE, and moving it last took the file
+    selection with it.
+
+    word_stats asks for two modules and names tokens.py first. Handed a ticket for
+    stats.py and then told to read a two-file spec as its final word, the editor wrote
+    tokens.py INTO stats.py — the file on disk opened with `# outputs/tokens.py` and
+    defined tokenize(). Every run. 3/3 -> 0/3.
+
+    The requirement says what correct means. The ticket says which file this call is
+    for, and that fact has to survive to the end of the prompt.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from langchain_core.messages import HumanMessage
+
+    from multi_hive.nodes.execution import async_editor_node as mod
+
+    captured: dict = {}
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            captured["user"] = messages[-1].content
+            return type("R", (), {"content": "```python\nx = 1\n```"})()
+
+    # The real two-file objective, in the order that broke it: tokens.py FIRST.
+    objective = (
+        "Implement a two-module word-frequency tool.\n"
+        "outputs/tokens.py defines: tokenize(text) -> list[str]\n"
+        "outputs/stats.py defines: top_words(text, n) -> list[tuple[str, int]]\n"
+        "stats.py MUST import tokenize from tokens.py."
+    )
+
+    with patch.object(mod, "get_async_llm", lambda *a, **k: _FakeLLM()):
+        asyncio.run(
+            mod.async_editor_node(
+                {
+                    "current_task": "implement top_words",
+                    "active_file": "outputs/stats.py",
+                    "messages": [HumanMessage(content=objective)],
+                    "project_files": {},
+                }
+            )
+        )
+
+    user = captured["user"]
+
+    # The requirement still reaches the model, and still comes after the ticket.
+    assert "MUST import tokenize" in user
+    assert user.rindex("MUST import tokenize") > user.rindex("EXECUTE THIS SPECIFIC TASK")
+
+    # But the FILE is the last word — after the objective, not before it.
+    assert "YOU ARE WRITING EXACTLY ONE FILE: outputs/stats.py" in user
+    assert user.rindex("YOU ARE WRITING EXACTLY ONE FILE") > user.rindex("MUST import tokenize")
+
+
+def test_the_file_anchor_survives_contract_mode():
+    """The anchor is appended after BOTH branches, not just the plain one."""
+    import asyncio
+    from unittest.mock import patch
+
+    from langchain_core.messages import HumanMessage
+
+    from multi_hive.nodes.execution import async_editor_node as mod
+
+    captured: dict = {}
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            captured["user"] = messages[-1].content
+            return type("R", (), {"content": "```python\nx = 1\n```"})()
+
+    with patch.object(mod, "get_async_llm", lambda *a, **k: _FakeLLM()):
+        asyncio.run(
+            mod.async_editor_node(
+                {
+                    "current_task": "implement top_words",
+                    "active_file": "outputs/stats.py",
+                    "messages": [HumanMessage(content="outputs/tokens.py defines tokenize")],
+                    "project_files": {},
+                    "contracts": {"outputs/stats.py": "assert top_words('a', 1) == [('a', 1)]"},
+                }
+            )
+        )
+
+    user = captured["user"]
+    assert "YOU ARE WRITING EXACTLY ONE FILE: outputs/stats.py" in user
+    # ...and the contract is still the judge in contract mode — the anchor does not
+    # reintroduce the authority contradiction that gamed word_wrap.
+    assert "Where they disagree, this wins" not in user
+    assert user.rindex("YOU ARE WRITING EXACTLY ONE FILE") > user.rindex("for CONTEXT")
+
+
 def test_the_strong_model_gets_a_blank_page_on_escalation():
     """
     Finding 11. On escalation the strong model used to inherit the fast model's

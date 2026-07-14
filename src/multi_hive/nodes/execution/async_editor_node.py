@@ -277,6 +277,26 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
             f"means. Where they disagree, this wins:{newline}{global_objective}"
         )
 
+    # The FILE ANCHOR, and it must come after the objective.
+    #
+    # Putting the requirement last is right — it carries the traps a ticket-writer's
+    # paraphrase drops. But an objective can describe MORE THAN ONE FILE, and once it
+    # became the terminal instruction it took the file selection with it.
+    #
+    # word_stats asks for two modules and names tokens.py first. The editor, handed a
+    # ticket for stats.py and then told to read a two-file spec as its final word,
+    # wrote tokens.py — into stats.py. The file on disk opened with the comment
+    # `# outputs/tokens.py` and defined tokenize(). Every run. 3/3 -> 0/3.
+    #
+    # The requirement says what correct means. It does not say which file this call is
+    # for; the ticket does, and that fact has to survive to the end of the prompt.
+    user_prompt += (
+        f"{newline}{newline}YOU ARE WRITING EXACTLY ONE FILE: {active_file}{newline}"
+        f"The requirement above may describe several files. The others are written by "
+        f"separate calls — do NOT write them here. Output ONLY the full contents of "
+        f"{active_file}."
+    )
+
     # ── Generation ────────────────────────────────────────────────────────────
     try:
         llm = get_async_llm("editor", tier)
