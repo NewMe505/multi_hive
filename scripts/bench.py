@@ -168,6 +168,15 @@ def bench_models(models: list[str], repeat: int = 1) -> list[history.Run]:
                     "wall_sec": statistics.median([r["wall_sec"] for r in reps]),
                     "tok_per_sec": statistics.median([r.get("tok_per_sec", 0) for r in reps]),
                     "output_tokens": statistics.median([r.get("output_tokens", 0) for r in reps]),
+                    # Cost, so the one-shot baseline and the pipeline can be compared
+                    # on what they SPENT and not only on what they scored. Without
+                    # this the `models` row printed "tokens 0" and the whole
+                    # efficiency question was unanswerable.
+                    "input_tokens": statistics.median([r.get("input_tokens", 0) for r in reps]),
+                    "total_tokens": statistics.median([r.get("total_tokens", 0) for r in reps]),
+                    "attempts": 1,
+                    "first_attempt_passed": passes == len(reps),
+                    "usd": 0.0,
                     "gpu_placement": reps[0].get("gpu_placement", "?"),
                 }
             )
