@@ -98,44 +98,59 @@ def _extract_code(raw: str) -> str:
     return max(matches, key=len).strip() if matches else ""
 
 
-# "# FILE: outputs/stats.py" — how a one-shot response labels which block is which.
-_FILE_MARK = re.compile(r"#\s*FILE:\s*(?:outputs/)?([\w.\-]+\.py)", re.IGNORECASE)
-
-
 def _extract_files(raw: str, task: Task) -> dict[str, str]:
     """
     Pull the task's files out of a single model response.
 
     Single-file tasks keep the old behaviour exactly: the longest fenced block.
 
-    Multi-file tasks need to know which block is which, so run_model asks the model
-    to label each with `# FILE: outputs/<name>`. An unlabelled block is DROPPED
-    rather than guessed at: assigning a block to the wrong file would score a
-    coherent answer as a failure, and inventing a mapping is the sort of
-    helpfulness that turns a benchmark into a story.
+    Multi-file tasks need to know which block is which. run_model ASKS for
+    `# FILE: outputs/<name>`, but a benchmark must not score a model on whether it
+    obeyed a formatting request — it must score whether it wrote the program.
 
-    A one-shot model that genuinely cannot produce two coherent files therefore
-    scores a real failure ("missing outputs/tokens.py"), not a harness artefact.
-    That has to hold for the multi-file comparison to mean anything at all — the
-    entire question is whether the pipeline beats one prompt, and the answer is
-    worthless if the prompt was handicapped by the grader.
+    The first version of this only accepted that exact marker, and the 30B failed
+    `word_stats` three times with "no code" while almost certainly having written
+    both files, labelled the natural way (`# tokens.py`). That is a HARNESS
+    ARTEFACT scored as a model failure, and it biases the multi-file comparison in
+    favour of the pipeline — which is the conclusion this benchmark exists to test,
+    and therefore the one it must never be allowed to manufacture.
+
+    So the filename is looked for anywhere in the block's opening lines OR in the
+    prose immediately before its fence — `# FILE: outputs/stats.py`, `# stats.py`,
+    `**outputs/stats.py**`, `Here is stats.py:` all work.
+
+    What is still NOT done is guessing. A block with no filename anywhere near it is
+    dropped, not assigned by position: mapping a block to the wrong file would score
+    a coherent answer as a failure, and inventing a mapping is the kind of
+    helpfulness that turns a benchmark into a story. A model that genuinely cannot
+    produce two coherent files scores a real failure ("missing outputs/tokens.py").
     """
     fence = chr(96) * 3
-    blocks = re.findall(fence + r"python\n(.*?)\n" + fence, raw, re.DOTALL)
-    if not blocks:
+    pattern = re.compile(fence + r"python\n(.*?)\n" + fence, re.DOTALL)
+
+    matches = list(pattern.finditer(raw))
+    if not matches:
         return {}
 
     if len(task.files) == 1:
-        return {task.filename: max(blocks, key=len).strip()}
+        return {task.filename: max((m.group(1) for m in matches), key=len).strip()}
 
     found: dict[str, str] = {}
-    for block in blocks:
-        mark = _FILE_MARK.search(block[:300])
-        if not mark:
-            continue
-        name = mark.group(1)
-        if name in task.files:
-            found[name] = block.strip()
+    for match in matches:
+        block = match.group(1)
+
+        # The block's first few lines, plus the prose leading up to its fence —
+        # models name the file in either place, and which one is not the model's
+        # fault.
+        preamble = raw[max(0, match.start() - 160) : match.start()]
+        head = preamble + "\n".join(block.splitlines()[:4])
+
+        # The filename mentioned FIRST wins. A stats.py block whose body says
+        # "from tokens import ..." must not be filed as tokens.py just because the
+        # other name appears somewhere in it — the label is the one at the top.
+        hits = [(head.find(name), name) for name in task.files if name in head]
+        if hits:
+            found.setdefault(min(hits)[1], block.strip())
 
     return found
 
