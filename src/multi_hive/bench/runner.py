@@ -98,6 +98,37 @@ def _extract_code(raw: str) -> str:
     return max(matches, key=len).strip() if matches else ""
 
 
+_FILE_HEADER = re.compile(r"^[ \t]*#[ \t]*FILE:[ \t]*(\S+?\.py)[ \t]*$", re.MULTILINE)
+
+
+def _extract_unfenced(raw: str, task: Task) -> dict[str, str]:
+    """
+    Split an unfenced, `# FILE:`-labelled response into its files.
+
+    The 30B answers word_stats exactly this way — see _extract_files. Everything
+    between one header and the next belongs to that file. A repeated header (it
+    emits `# FILE: outputs/stats.py` twice, once for the module and once for a
+    demo block) keeps the FIRST occurrence: the later one is a trailing
+    `if __name__ == '__main__':` section, and appending it would be inventing code
+    the model did not put in the module.
+    """
+    headers = list(_FILE_HEADER.finditer(raw))
+    if not headers:
+        return {}
+
+    found: dict[str, str] = {}
+    for i, header in enumerate(headers):
+        name = header.group(1).split("/")[-1]
+        if name not in task.files or name in found:
+            continue
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
+        body = raw[header.end() : end].strip()
+        if body:
+            found[name] = body
+
+    return found
+
+
 def _extract_files(raw: str, task: Task) -> dict[str, str]:
     """
     Pull the task's files out of a single model response.
@@ -119,6 +150,26 @@ def _extract_files(raw: str, task: Task) -> dict[str, str]:
     prose immediately before its fence — `# FILE: outputs/stats.py`, `# stats.py`,
     `**outputs/stats.py**`, `Here is stats.py:` all work.
 
+    And it reads UNFENCED output, which is how the 30B actually answers this task.
+    Asked for one fenced block per file, it emitted this instead:
+
+        # FILE: outputs/tokens.py
+        import re
+        ...
+        # FILE: outputs/stats.py
+        from outputs.tokens import tokenize
+
+    Perfectly labelled, both files, and not a code fence in sight — because the
+    multi-file instruction ("one block per file") CONTRADICTS the editor system
+    prompt it is given, which says "output the FULL updated script inside a single
+    ```python block". The model resolved our own contradiction by dropping fences,
+    and the extractor, which only looked inside fences, scored it "no code" three
+    times out of three.
+
+    That is the same harness bug as the paragraph above, in a new costume, and it
+    failed in the same direction: flattering the pipeline. Twice is a pattern. A
+    benchmark whose errors all favour the hypothesis is not a benchmark.
+
     What is still NOT done is guessing. A block with no filename anywhere near it is
     dropped, not assigned by position: mapping a block to the wrong file would score
     a coherent answer as a failure, and inventing a mapping is the kind of
@@ -129,8 +180,10 @@ def _extract_files(raw: str, task: Task) -> dict[str, str]:
     pattern = re.compile(fence + r"python\n(.*?)\n" + fence, re.DOTALL)
 
     matches = list(pattern.finditer(raw))
+
     if not matches:
-        return {}
+        # No fences. If the response is labelled, read it anyway.
+        return _extract_unfenced(raw, task) if len(task.files) > 1 else {}
 
     if len(task.files) == 1:
         return {task.filename: max((m.group(1) for m in matches), key=len).strip()}

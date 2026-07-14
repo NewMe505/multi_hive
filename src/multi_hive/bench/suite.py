@@ -383,9 +383,20 @@ assert got == {"b": 1}, f"empty nested dict produced a key: {got}"
         # input. Neither is stated in the prompt.
         tests="""
 import sys
-assert "tokens" in sys.modules, "stats.py did not import tokens.py — it reimplemented it"
+# BOTH spellings are a real import, and this check must accept both:
+#
+#     from tokens import tokenize          -> sys.modules["tokens"]
+#     from outputs.tokens import tokenize  -> sys.modules["outputs.tokens"]
+#
+# The task says "save the files to outputs/tokens.py", so reading `outputs` as a
+# package is entirely reasonable — and it is exactly what the 30B writes. Asserting
+# the literal string "tokens" failed it for the SPELLING of a correct import, which
+# is not what this check is for. What it is for is: did stats.py DELEGATE, or did it
+# quietly reimplement the tokenizer inside itself? Both spellings delegate.
+_mod = next((m for m in sys.modules if m == "tokens" or m.endswith(".tokens")), None)
+assert _mod, "stats.py did not import tokens.py — it reimplemented it"
 
-T = sys.modules["tokens"]
+T = sys.modules[_mod]
 assert T.tokenize("Hello, world!") == ["hello", "world"], T.tokenize("Hello, world!")
 assert T.tokenize("  a   b  ") == ["a", "b"]
 assert T.tokenize("...") == [], "punctuation-only word was not dropped"
@@ -417,6 +428,13 @@ BY_NAME = {task.name: task for task in TASKS}
 # the return code alone, which a top-level exit(0) or os._exit(0) can forge.
 _HARNESS = """
 import importlib.util, sys, traceback
+# Mirror the real workspace: PYTHONPATH=<workspace> and the script running from
+# inside <workspace>/outputs. Both are on the path there, so BOTH
+# `from tokens import tokenize` (sibling) and `from outputs.tokens import tokenize`
+# (namespace package) resolve. Flattening the files into one directory, as this
+# harness used to, silently broke the second — and the 30B writes the second.
+sys.path.insert(0, r"{outputs_dir}")
+sys.path.insert(0, r"{root_dir}")
 spec = importlib.util.spec_from_file_location("candidate", r"{module}")
 M = importlib.util.module_from_spec(spec)
 try:
@@ -442,16 +460,32 @@ def grade(code: str | dict[str, str], task: Task, timeout: int = 60) -> Grade:
     with it.
 
     `code` is either a single source string (the common case — one file), or a
-    {filename: source} map for a multi-file task. Every file is written into the
-    temp directory side by side, so the graded module's own
-    `from tokens import tokenize` resolves against its sibling exactly as it does
-    in the workspace: the harness script lives in that directory, so it is
-    sys.path[0].
+    {filename: source} map for a multi-file task.
 
-    A missing sibling is a FAILURE, not a crash. It has to be — "the model wrote
-    one of the two files it was asked for" is precisely the outcome a multi-file
-    task exists to catch, and reporting it as an import error would hide what
-    actually went wrong.
+    **The layout mirrors the real workspace, and it has to.** Files go into
+    `<tmp>/outputs/`, and the harness puts BOTH `<tmp>` and `<tmp>/outputs` on
+    sys.path — exactly what the hive's own sandbox does (`PYTHONPATH=<workspace>`,
+    with the script running from inside `<workspace>/outputs`). So both spellings of
+    the import resolve:
+
+        from tokens import tokenize          # sibling
+        from outputs.tokens import tokenize  # namespace package
+
+    This harness used to flatten every file into one directory, which silently broke
+    the second spelling — and the second spelling is what the 30B writes, having been
+    told "save the files to outputs/tokens.py". It scored ModuleNotFoundError on code
+    that runs correctly in the workspace the task describes.
+
+    That was the FOURTH grader bug in this benchmark to fail in the same direction:
+    against the one-shot baseline, and therefore in favour of the pipeline — which is
+    the hypothesis under test. A benchmark whose errors all flatter the conclusion is
+    not a benchmark, it is a press release. The grader must reproduce the runtime the
+    task describes, not a convenient fiction of it.
+
+    A missing sibling is still a FAILURE, not a crash. It has to be — "the model wrote
+    one of the two files it was asked for" is precisely the outcome a multi-file task
+    exists to catch, and reporting it as an import error would hide what actually went
+    wrong.
     """
     files = {task.filename: code} if isinstance(code, str) else dict(code)
 
@@ -469,16 +503,17 @@ def grade(code: str | dict[str, str], task: Task, timeout: int = 60) -> Grade:
     result = Grade(extracted=True)
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Every file, side by side — the graded module imports its siblings by
-        # plain name, which only works because they share a directory.
+        # <tmp>/outputs/<name> — the workspace layout the task's own prompt names.
+        outputs = Path(tmp) / "outputs"
+        outputs.mkdir()
         for name, source in files.items():
-            (Path(tmp) / name).write_text(source, encoding="utf-8")
+            (outputs / name).write_text(source, encoding="utf-8")
 
-        module = Path(tmp) / task.filename
+        module = outputs / task.filename
 
         for name in task.files:
             compiled = subprocess.run(
-                [sys.executable, "-m", "py_compile", str(Path(tmp) / name)],
+                [sys.executable, "-m", "py_compile", str(outputs / name)],
                 capture_output=True,
                 text=True,
             )
@@ -493,7 +528,14 @@ def grade(code: str | dict[str, str], task: Task, timeout: int = 60) -> Grade:
         token = secrets.token_hex(8)
         harness = Path(tmp) / "harness.py"
         harness.write_text(
-            _HARNESS.format(module=str(module), body=body, token=token), encoding="utf-8"
+            _HARNESS.format(
+                module=str(module),
+                outputs_dir=str(outputs),
+                root_dir=str(tmp),
+                body=body,
+                token=token,
+            ),
+            encoding="utf-8",
         )
 
         try:
