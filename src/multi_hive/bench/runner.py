@@ -119,7 +119,16 @@ def _extract_unfenced(raw: str, task: Task) -> dict[str, str]:
 
     found: dict[str, str] = {}
     for i, header in enumerate(headers):
-        name = header.group(1).split("/")[-1]
+        # The FULL labelled path, not just the basename.
+        #
+        # Taking basename() meant `# FILE: src/tokens.py` was accepted as tokens.py.
+        # The sprint suite refuses that path (normalise_model_path rejects src/ for an
+        # outputs/ task), so the one-shot baseline was being held to a WEAKER standard
+        # than the pipeline — on the exact axis the multi-file comparison exists to
+        # test. Four earlier grader bugs favoured the pipeline; this one favoured the
+        # baseline, and it is the same disease.
+        labelled = header.group(1).lstrip("./")
+        name = labelled[len("outputs/") :] if labelled.startswith("outputs/") else labelled
         if name not in task.files or name in found:
             continue
         end = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
@@ -384,16 +393,30 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
         code = files.get(target, "")
         if not code.strip():
             return
-        fingerprint = hash(code)
-        if fingerprint in seen:
-            return
-        seen.add(fingerprint)
-        # The siblings a multi-file task needs come off disk — the editor writes one
-        # file at a time, and an earlier ticket's file is already flushed.
+
+        # A multi-file candidate is only gradeable once its siblings EXIST.
+        #
+        # The editor writes one file per ticket. So the first stats.py candidate is
+        # produced while tokens.py may not be on disk yet, and grading it there
+        # returns "missing outputs/tokens.py" — recording passed=False for a file
+        # whose quality was never assessed. first_attempt_passed was therefore
+        # SYSTEMATICALLY False for word_stats regardless of what the model wrote:
+        # the metric built to illuminate the multi-file task was broken for exactly
+        # that task.
+        #
+        # An incomplete system is not a failed attempt. It is not an attempt yet.
         payload = {task.filename: code}
         for name in task.extra_files:
             path = OUTPUTS_DIR / name
-            payload[name] = path.read_text(encoding="utf-8") if path.exists() else ""
+            sibling = path.read_text(encoding="utf-8") if path.exists() else ""
+            if not sibling.strip():
+                return  # not a candidate yet — the system is half-written
+            payload[name] = sibling
+
+        fingerprint = hash(tuple(sorted(payload.items())))
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
         candidates.append(grade(payload, task).passed)
 
     try:
@@ -468,6 +491,9 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
         "output_tokens": spend.get("output_tokens", 0),
         "total_tokens": spend.get("total_tokens", 0),
         "usd": spend.get("usd", 0.0),
+        # Calls the governor could not read. A cost figure computed from a broken
+        # meter is worse than no cost figure: plausible, low, and wrong.
+        "unmetered": spend.get("unmetered", 0),
         # The gaming detector. In contract mode, contract_satisfied=True with
         # passed=False means the code cleared the human's asserts and failed the
         # hidden ones — which is what memorising the contract's literal inputs

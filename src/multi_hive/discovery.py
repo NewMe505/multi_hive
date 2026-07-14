@@ -219,11 +219,18 @@ def parked(sprints: list[dict] | None = None) -> list[WorkItem]:
     for key, sprint in _broken(records).items():
         failure = (sprint.get("failure") or "").strip()
         because = f" — {failure[:70]}" if failure else ""
+
+        # attempts_for counts only MERIT attempts, so a FAILED-only item scores 0 —
+        # and parked() would print "attempt 0" for work that was in fact attempted
+        # once and died. A small lie, in exactly the artefact a human reads to decide
+        # what to fix. Count the records that exist.
+        tried = sum(1 for s in records if s.get("key") == key)
+
         items.append(
             WorkItem(
                 objective=sprint["objective"],
                 key=key,
-                attempt=journal.attempts_for(key, records),
+                attempt=tried,
                 tier_floor=None,  # nothing was learned about the task; do not presume
                 reason=(
                     f"failed before the retry ladder even engaged{because}. "

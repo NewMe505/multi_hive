@@ -11,6 +11,103 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Changed
+
+- **`HIVE_SANDBOX_TIMEOUT` default is now 30s (was 10s).** The old 10s was 6x
+  stricter than the grader's 60s, so correct code whose demo block was merely slow
+  died in the hive and passed in the bench — the system rejecting work its own scorer
+  would accept, which is the worst direction for a disagreement. But 60s was the
+  wrong correction: `suite.grade()` pays its 60s ONCE, on the final artefact, while
+  this sandbox runs on EVERY editor attempt. At 60s a model that emits `while True`
+  costs 240s per task instead of 40. 30s clears any legitimate demo block and stays
+  bounded.
+
+- **The benchmark reports the story, not just the score.** `sprint` now records
+  tokens, USD, editor attempts, whether the FIRST file written already passed, and
+  whether the sprint ever produced a passing file and then shipped something else.
+  "9/9 passed" hides everything that matters: two systems can both score 9/9 while one
+  gets it right first time for 4k tokens and the other thrashes for 40k.
+
+  The last of those — `DISCARDED A PASSING ANSWER` — measured a failure mode that was
+  structurally invisible, because the bench only ever graded the LAST file on disk. It
+  came back **zero**, which is why best-attempt retention was NOT built. Measuring
+  before building saved that day.
+
+### Added
+
+- **`HIVE_PLAN_TIER`** — pins the planner and ticket writer to a tier. The plan decides
+  what the task IS, and everything downstream executes that paraphrase; a bad ticket
+  cannot be rescued by escalating the editor. Defaults to unset: measured on ollama it
+  was **1.80x slower for zero quality gain** (the 7B/30B VRAM swap), and it ships as a
+  knob rather than a default because of it. On `anthropic` there is no swap and it is
+  very likely right — but that is unmeasured, and this project has twice reverted a
+  change that was obviously right.
+
+- **`word_stats`** — the first bench task the hive is actually FOR. Two files, and the
+  graded module IMPORTS the other, so the model must hold an interface neither file
+  states alone. Every other task is one self-contained function — exactly what a
+  one-shot prompt is best at, and exactly where a pipeline has nothing to add.
+
+### Fixed
+
+- **The 7B decided what every task was, and nothing could override it.**
+  `sprint_planner` and `ticket_writer` called `get_llm()` with no tier, which silently
+  defaults to `fast`. So `HIVE_FORCE_TIER` never reached them and neither did the
+  escalation ladder — "the hive on the strong model" was never true. And a ticket-writer
+  JSON parse failure does not fail a task, it kills the whole SPRINT: measured killing
+  `lru_cache --contract` on three runs out of three. Both nodes route their tier now,
+  and the ticket writer retries once on the strong model.
+
+- **The spec never reached the people judging the work.** The editor's terminal
+  instruction was `EXECUTE THIS SPECIFIC TASK: <ticket>` — a paraphrase of a summary —
+  and the semantic reviewer was never given the objective at all. Every trap in the
+  benchmark is exactly the clause a paraphrase drops ("ties are broken alphabetically",
+  "touching intervals count as overlapping"). The requirement now goes to the editor
+  last and verbatim, and to the reviewer first, as the authority. **Measured: 6/9 → 7/9,
+  with `semver` going from a coin flip to 3/3.**
+
+- **The strong model never got a clean shot.** On escalation it inherited the fast
+  model's broken code and the order "FIX THE CODE SO IT PASSES" — asked to patch a bad
+  draft, while `bench models` hands the same model a blank page and it scores 8-9/9. It
+  gets a blank page now; the traceback survives as a warning, not a leash.
+
+- **An escalation cancelled every file behind it.** `human_gate_node` returned
+  `task_queue: []`, so one hard file poisoned every easy file queued behind it — in a
+  project whose premise is MULTI-file generation. It skips the failed task and keeps
+  the queue, with a sticky `sprint_escalated` flag so a sprint that carries on cannot
+  quietly report itself CLEAN.
+
+- **Five grader bugs, every one of them favouring the pipeline.** The multi-file task
+  scored the one-shot 30B "no code" three times running. It was not "no code" — the
+  extractor demanded exact `# FILE:` labels, then only read fenced output (the 30B
+  emits none), the grader flattened the workspace layout so `from outputs.tokens import`
+  raised ModuleNotFoundError, and the delegation check asserted a literal module name so
+  a correct import was failed for its SPELLING. A benchmark whose errors all flatter the
+  conclusion is not a benchmark.
+
+- **`clean_workspace()` could delete the user's source tree.** It recursively unlinks
+  every `*.py` under `HIVE_WORKSPACE`, which was unvalidated — and the README says
+  "Relocate it with `HIVE_WORKSPACE=/some/path`". `HIVE_WORKSPACE=.` would have deleted
+  the entire `multi_hive` package. A workspace that is, or contains, this source tree —
+  or is `$HOME`, or a filesystem root — is now refused at import.
+
+- **The governor failed open.** `_tokens_from` returned `(0, 0)` for any response it
+  could not parse, which `record()` added as $0.00 — indistinguishable from a free call.
+  One change to a provider's usage field and the meter reads zero forever while an
+  overnight loop bills the night. Unreadable is now counted as unreadable, and
+  `HIVE_MAX_UNMETERED` stops the run when a ceiling that DEPENDS on the meter can no
+  longer be trusted.
+
+- **One crashed item abandoned the whole backlog.** A crash does not advance the attempt
+  counter, so the item reappeared forever — and the supervisor's repeat-detector
+  responded by breaking out of the entire loop. Items B and C never ran because item A
+  kept crashing. A stuck item is a fact about that item; it is skipped now, not fatal.
+
+- Objective truncation is logged instead of silently cutting mid-character. The sandbox
+  no longer disagrees with its own grader. `semantic_reviewer` is no longer invited to
+  reject on a save path it structurally cannot see.
+
+
 ### Fixed
 
 - **The benchmark was contaminated, and every sprint number this project has ever

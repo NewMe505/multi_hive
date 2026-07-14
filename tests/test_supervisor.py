@@ -193,3 +193,42 @@ def test_the_supervisor_replays_on_the_tier_that_has_not_failed_yet(monkeypatch)
 
     assert calls[0]["tier_floor"] == "strong"
     assert calls[0]["objective"] == "wrap it"  # replayed byte for byte
+
+
+def test_a_stuck_item_does_not_abandon_the_rest_of_the_backlog(monkeypatch):
+    """
+    A bug introduced by the merit-attempts fix, and caught in review.
+
+    A crashed sprint does not advance attempts_for, so the item reappears from
+    discover() at the same attempt number forever. The supervisor detected that
+    repeat and BROKE OUT OF THE WHOLE LOOP — so one crashed item abandoned every
+    OTHER item in the backlog. Items B and C would never run, this night or any
+    night, because A would crash-and-repeat each time.
+
+    A stuck item is a fact about that item. It is not a reason to stop working on
+    everything else.
+    """
+    monkeypatch.setattr(discovery, "MAX_DISCOVERY_ATTEMPTS", 5)
+
+    calls: list[str] = []
+
+    async def fake_run_sprint(objective, broker, *, source, attempt, tier_floor):
+        calls.append(objective)
+        if objective == "the poison pill":
+            raise RuntimeError("ollama fell over")
+        journal.record_sprint(objective, journal.CLEAN, source=source, attempt=attempt)
+        return SprintOutcome(key=journal.key_for(objective), status=journal.CLEAN)
+
+    monkeypatch.setattr(supervisor, "run_sprint", fake_run_sprint)
+
+    journal.record_sprint("the poison pill", journal.ESCALATED)
+    journal.record_sprint("good work A", journal.ESCALATED)
+    journal.record_sprint("good work B", journal.ESCALATED)
+
+    asyncio.run(asyncio.wait_for(supervisor.run(), timeout=10))
+
+    # The crash must not have eaten the other two.
+    assert "good work A" in calls, "a crashed item abandoned the rest of the backlog"
+    assert "good work B" in calls
+    # ...and the poison pill was tried once and then skipped, not retried forever.
+    assert calls.count("the poison pill") == 1

@@ -364,6 +364,7 @@ def spend_since(before: Spend) -> dict[str, Any]:
         "total_tokens": now.total_tokens - before.total_tokens,
         "usd": round(now.usd - before.usd, 6),
         "calls": now.calls - before.calls,
+        "unmetered": now.unmetered - before.unmetered,
     }
 
 

@@ -129,19 +129,41 @@ async def run(watch_sec: float = 0.0) -> int:
                 await asyncio.sleep(watch_sec)
                 continue
 
-            repeats = [i for i in items if (i.key, i.attempt) in attempted]
-            if repeats:
+            # Work this run has already done is SKIPPED, not fatal.
+            #
+            # This used to `break` out of the whole loop, and that was a real bug I
+            # introduced with the merit-attempts fix: a crashed item does not advance
+            # `attempts_for`, so it reappears from discover() at the same attempt
+            # number forever. Detecting the repeat and stopping the loop meant ONE
+            # crashed item abandoned every OTHER item in the backlog — items B and C
+            # never ran, this night or any night, because A would crash-and-repeat
+            # each time.
+            #
+            # A stuck item is a fact about that item. It is not a reason to stop
+            # working on everything else. Skip it, keep going, and only stop when
+            # there is nothing left that is NOT stuck — which `fresh` being empty
+            # says precisely.
+            stuck = [i for i in items if (i.key, i.attempt) in attempted]
+            fresh = [i for i in items if (i.key, i.attempt) not in attempted]
+
+            if stuck:
                 console.print(
-                    "[bold red]⚠  Discovery is handing back work this run already did "
-                    "— the journal is not advancing (disk full?). Stopping rather than "
-                    "spinning.[/]"
+                    f"[yellow]⚠  Skipping {len(stuck)} item(s) this run already "
+                    f"attempted — the journal is not advancing for them (a crash, or a "
+                    f"full disk). They need a human; see the digest.[/]"
+                )
+
+            if not fresh:
+                console.print(
+                    "[bold red]⚠  Every discovered item is one this run already did. "
+                    "Nothing is advancing. Stopping rather than spinning.[/]"
                 )
                 break
 
-            console.print(f"\n[bold]🔎 Discovered {len(items)} work item(s).[/]")
+            console.print(f"\n[bold]🔎 Discovered {len(fresh)} work item(s).[/]")
 
             progressed = 0
-            for item in items:
+            for item in fresh:
                 if gov.breach():
                     break
 
