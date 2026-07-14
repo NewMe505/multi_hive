@@ -83,16 +83,58 @@ async def human_gate_node(state: dict[str, Any]) -> dict[str, Any]:
     else:
         console.print("[dim]Headless mode — no gate_event, routing to retrospector.[/]")
 
-    # ── Clear blocking state ──────────────────────────────────────────────────
-    # current_task=None + editor_error=None + empty queue makes reviewer_logic
-    # return "retrospector_node" on the next evaluation, ending the sprint
-    # cleanly instead of re-entering the editor loop.
+    # ── Skip the failed task. Keep the rest of the queue. ─────────────────────
+    #
+    # This used to return `task_queue: []`, throwing the whole queue away.
+    #
+    # So an escalation on ticket 1 of 3 silently cancelled tickets 2 and 3 — they
+    # were never attempted, and nothing said so. If the file being graded belonged
+    # to ticket 2, the sprint scored "no code": a verdict indistinguishable from
+    # "the model cannot write this", for work the model was never asked to do. One
+    # hard file poisoned every easy file queued behind it.
+    #
+    # An escalation is a statement about ONE task — this one beat the retry ladder
+    # and a human should look at it. It says nothing about the tasks behind it, and
+    # it has no business speaking for them. In a project whose whole premise is
+    # MULTI-file generation, abandoning the other files on the first hard one is a
+    # failure at the headline use case.
+    #
+    # `sprint_escalated` is the sticky flag, and it is why this is safe. It is set
+    # here and NEVER reset — unlike loop_health, which agent_router_node zeroes at
+    # the start of each task (correctly: a stale repeat_error_hash would otherwise
+    # trip an escalation on the first retry of an unrelated task). Without a sticky
+    # flag the sprint would go on to finish the remaining files and then report
+    # itself CLEAN, hiding the very escalation this gate exists to announce. That
+    # silence is the exact failure the gate was built to prevent.
+    #
+    # Termination: the queue strictly shrinks. Each visit here pops one task, so
+    # the worst case is one escalation per task and then the retrospector.
+    queue = list(state.get("task_queue") or [])
+
     loop_health["escalated"] = True
     loop_health["last_node"] = "human_gate_node"
 
+    if not queue:
+        return {
+            "current_task": None,
+            "task_queue": [],
+            "editor_error": None,
+            "loop_health": loop_health,
+            "sprint_escalated": True,
+        }
+
+    nxt = queue.pop(0)
+    console.print(
+        f"[dim]Skipping the escalated task — {len(queue) + 1} left. "
+        f"Continuing with [cyan]{nxt.get('file', '?')}[/].[/]"
+    )
+
     return {
-        "current_task": None,
-        "task_queue": [],
+        "current_task": nxt.get("task"),
+        "active_file": nxt.get("file"),
+        "task_queue": queue,
         "editor_error": None,
+        "editor_retries": 0,
         "loop_health": loop_health,
+        "sprint_escalated": True,
     }

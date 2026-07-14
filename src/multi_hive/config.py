@@ -102,6 +102,41 @@ ESCALATE_AFTER_FAILURES = int(os.environ.get("HIVE_ESCALATE_AFTER", "1"))
 # enough VRAM that none of the above trade-offs apply.
 FORCE_TIER = os.environ.get("HIVE_FORCE_TIER", "").strip().lower()
 
+# Which tier drafts the plan and writes the tickets. "fast" | "strong" | "".
+# Empty means the normal router decides, which is the current behaviour.
+#
+# Why you would want this on "strong"
+# -----------------------------------
+# The plan and the tickets decide what the task IS. Every node after them — the
+# editor, both reviewers, the grader — is executing and judging that paraphrase.
+# A bad ticket cannot be rescued by escalating the editor, because the editor is
+# faithfully building the wrong thing.
+#
+# It is also the cheapest place in the system to spend the good model. The planner
+# emits a few hundred tokens and the ticket writer about 200 of JSON; the editor
+# emits thousands, one to three times over. The plan is a rounding error in the
+# inference budget and it determines everything downstream of it.
+#
+# And it removes an entire failure mode. The 7B's JSON is stochastic, and a parse
+# failure in the ticket writer does not fail a task — it kills the whole sprint.
+# Measured: it killed lru_cache --contract on three runs out of three.
+#
+# Why it is NOT the default on ollama
+# -----------------------------------
+# VRAM. The 7B (4.7 GB) and the 30B (6.1 GB) do not fit in 8 GB together, so
+# planning on "strong" and writing on "fast" forces an eviction and a reload
+# between them: roughly 30-40s added to a sprint whose fast path currently finishes
+# in 19-30s. On `brackets` that is a tripling of wall time to improve a plan that
+# was already fine.
+#
+# None of that applies to the anthropic provider — no VRAM, no eviction, no reload,
+# and a few hundred tokens of the strong model costs cents. "strong" is very likely
+# right there. But it is UNMEASURED, and this project has twice reverted a change
+# that was obviously right and turned out not to be: spec_writer (3.11x slower for
+# zero quality gain) and deleting the self-asserts (1/4, down from 3/4). So it ships
+# as a knob, not as a default, until the benchmark has an opinion.
+PLAN_TIER = os.environ.get("HIVE_PLAN_TIER", "").strip().lower()
+
 # Back-compat: the single-model name, still honoured if someone sets HIVE_MODEL.
 MODEL_NAME = os.environ.get("HIVE_MODEL", MODELS["fast"])
 if os.environ.get("HIVE_MODEL"):

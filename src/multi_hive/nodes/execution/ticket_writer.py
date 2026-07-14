@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from multi_hive import prompts
 from multi_hive.core.llm_factory import get_llm
 from multi_hive.core.memory import log_rejection
+from multi_hive.core.model_router import STRONG, select_plan_tier
 from multi_hive.core.utils import normalise_model_path
 
 
@@ -156,7 +157,6 @@ def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
     if state.get("current_task") is not None:
         return {}
 
-    llm = get_llm("ticket")
     sprint_plan = state.get("sprint_plan") or ""
 
     # Pass the original user objective alongside the plan: the objective is the
@@ -169,20 +169,59 @@ def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
         f"USER OBJECTIVE (use any explicit file paths from here):\n{user_objective}\n\n"
         f"SPRINT PLAN:\n{sprint_plan}"
     )
+    messages = [
+        SystemMessage(content=prompts.get_ticket_writer_prompt()),
+        HumanMessage(content=ticket_input),
+    ]
 
-    response = llm.invoke(
-        [
-            SystemMessage(content=prompts.get_ticket_writer_prompt()),
-            HumanMessage(content=ticket_input),
-        ]
-    )
+    # The tier is ROUTED, not hardcoded.
+    #
+    # This node used to call get_llm("ticket") with no tier, which silently
+    # defaults to `fast` — so HIVE_FORCE_TIER, the operator's explicit override,
+    # did not reach it. "The hive on the strong model" was never true: the plan and
+    # the tickets were always written by the 7B, and the 7B decides what the task
+    # IS. Everything downstream is executing its paraphrase.
+    #
+    # Routed from the OBJECTIVE, because there is no ticket yet to route from —
+    # which is the point. HIVE_PLAN_TIER=strong pins this node and the planner to
+    # the good model; see select_plan_tier for why that is worth considering.
+    tier = select_plan_tier(user_objective)
+
+    response = get_llm("ticket", tier).invoke(messages)
     tasks = _extract_task_list(response.content)
 
+    # ── One retry, on the strong model ────────────────────────────────────────
+    #
+    # A parse failure here does not fail a task. It kills the ENTIRE SPRINT: no
+    # queue is built, reviewer_logic routes straight to the human gate, no code is
+    # written, and the run is scored "no code" — indistinguishable from "the model
+    # cannot code". A pure infrastructure failure, recorded as a model failure.
+    #
+    # This is not theoretical. In the first clean baseline it killed
+    # `lru_cache --contract` on THREE RUNS OUT OF THREE — 0/3 on a task the same
+    # pipeline passes comfortably when the JSON happens to parse. The 7B's JSON is
+    # stochastic; emitting a task queue is the one job in this system where a
+    # single bad sample costs everything.
+    #
+    # So: one retry on the strong model, whose JSON is far more reliable. It is a
+    # few seconds of inference against losing the whole sprint, and it only ever
+    # runs on the path that was already lost.
+    if not tasks and tier != STRONG:
+        log_rejection(
+            "ticket_writer",
+            f"JSON PARSE ERROR on the {tier} model — retrying once on {STRONG}. "
+            f"A parse failure here kills the whole sprint, so it is worth the "
+            f"inference.\nRaw response:\n{response.content[:400]}",
+        )
+        response = get_llm("ticket", STRONG).invoke(messages)
+        tasks = _extract_task_list(response.content)
+        tier = STRONG
+
     if not tasks:
-        # Log it. This failure produces an editor_error with no task queue behind
-        # it, which is a state the router has to handle specially — and when it
-        # went unlogged, the resulting loop was invisible: an empty ledger and no
-        # clue why the sprint was spinning.
+        # Both tiers failed to emit parseable JSON. Now it is a real failure.
+        #
+        # Logged, because when it went unlogged the resulting loop was invisible:
+        # an empty ledger, and no clue why the sprint was spinning.
         error = "JSON PARSE ERROR: TicketWriter did not output valid JSON."
         log_rejection("ticket_writer", f"{error}\nRaw response:\n{response.content[:600]}")
         return {

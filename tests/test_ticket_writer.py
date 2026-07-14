@@ -39,7 +39,10 @@ def _clean_ledger():
 
 def _run(tasks, monkeypatch):
     payload = json.dumps(tasks) if isinstance(tasks, list) else tasks
-    monkeypatch.setattr(tw_module, "get_llm", lambda _p: _FakeLLM(payload))
+    # (purpose, tier). The node ROUTES its tier now — it used to call get_llm with
+    # no tier at all, which silently defaulted to `fast`, so HIVE_FORCE_TIER never
+    # reached it and the 7B always decided what the task was.
+    monkeypatch.setattr(tw_module, "get_llm", lambda _p, _t=None: _FakeLLM(payload))
     return ticket_writer({"sprint_plan": "a plan", "messages": []})
 
 
@@ -113,6 +116,54 @@ def test_legal_plans_are_untouched(monkeypatch):
     assert out["active_file"] == "outputs/wrap.py"
     assert out["task_queue"][0]["file"] == "src/util.py"
     assert memory.get_recent_rejections("ticket_writer") == ""
+
+
+# ── A parse failure must not kill the whole sprint ───────────────────────────
+
+
+def test_unparseable_json_retries_on_the_strong_model(monkeypatch):
+    """
+    The failure the clean baseline caught red-handed.
+
+    A parse failure here does not fail a *task* — it kills the whole SPRINT. No
+    queue is built, reviewer_logic routes straight to the human gate, no code is
+    written, and the run is scored "no code": indistinguishable from "the model
+    cannot code", for a pure infrastructure failure.
+
+    It killed `lru_cache --contract` on THREE RUNS OUT OF THREE — 0/3 on a task the
+    same pipeline passes comfortably whenever the JSON happens to parse. The 7B's
+    JSON is stochastic, and emitting the task queue is the one job in this system
+    where a single bad sample costs everything.
+    """
+    calls: list[str] = []
+
+    def fake_get_llm(_purpose, tier=None):
+        calls.append(tier)
+        if len(calls) == 1:
+            return _FakeLLM("Sure! Here is the task list: (not JSON)")
+        return _FakeLLM(json.dumps([{"file": "outputs/lru.py", "task": "implement it"}]))
+
+    monkeypatch.setattr(tw_module, "get_llm", fake_get_llm)
+    out = ticket_writer({"sprint_plan": "a plan", "messages": []})
+
+    assert calls == ["fast", "strong"], calls  # retried, and on the better model
+    assert out["active_file"] == "outputs/lru.py"  # the sprint lives
+    assert "editor_error" not in out
+
+
+def test_both_tiers_failing_is_a_real_failure(monkeypatch):
+    """One retry, not an infinite one. If strong also fails, the sprint fails."""
+    calls: list[str] = []
+
+    def fake_get_llm(_purpose, tier=None):
+        calls.append(tier)
+        return _FakeLLM("still not JSON")
+
+    monkeypatch.setattr(tw_module, "get_llm", fake_get_llm)
+    out = ticket_writer({"sprint_plan": "a plan", "messages": []})
+
+    assert calls == ["fast", "strong"]  # tried twice, gave up
+    assert "JSON PARSE ERROR" in out["editor_error"]
 
 
 # ── One ticket per file ───────────────────────────────────────────────────────

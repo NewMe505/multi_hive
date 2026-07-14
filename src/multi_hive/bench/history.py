@@ -237,7 +237,32 @@ def compare(current: Run, baseline: Run) -> Comparison:
         baseline=baseline,
         current=current,
         quality_delta=current.passed - baseline.passed,
-        speed_ratio=(current.wall / baseline.wall) if baseline.wall else 1.0,
+        speed_ratio=_speed_ratio(current, baseline, shared),
         regressed_tasks=sorted(t for t in shared if was[t] and not now[t]),
         fixed_tasks=sorted(t for t in shared if not was[t] and now[t]),
     )
+
+
+def _speed_ratio(current: Run, baseline: Run, shared: set[str]) -> float:
+    """
+    Wall time on the tasks BOTH runs actually ran.
+
+    This used to be `current.wall / baseline.wall` — total suite wall time — which
+    is a fact about how many tasks are in the suite, not about how fast the code is.
+
+    The bug was latent until the suite grew from 4 tasks to 8. That run got 40%
+    FASTER per task (65s -> 38s, the one-ticket-per-file fix) and the gate reported
+    it as an 18% speed REGRESSION, because the total went up. A 25% speed gate on
+    that number would have failed the build for an improvement.
+
+    Same shape as the quality gate, which was fixed first: a raw total is not a
+    measurement. Compare like with like — the tasks present in both runs — and the
+    number survives the suite changing size.
+    """
+    if not shared:
+        return 1.0
+
+    before = sum(t.get("wall_sec", 0.0) for t in baseline.tasks if t["task"] in shared)
+    after = sum(t.get("wall_sec", 0.0) for t in current.tasks if t["task"] in shared)
+
+    return (after / before) if before else 1.0

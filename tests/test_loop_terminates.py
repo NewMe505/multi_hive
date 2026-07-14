@@ -209,3 +209,105 @@ async def test_empty_generation_is_a_failure_not_a_silent_success():
     assert delta["editor_retries"] == 1
     # And it must NOT have written an empty file on the success path.
     assert not delta.get("project_files", {}).get("outputs/add.py")
+
+
+# ── The gate skips the task; it does not cancel the sprint ───────────────────
+
+
+def test_escalation_skips_the_task_and_keeps_the_queue():
+    """
+    human_gate_node used to return `task_queue: []` — an escalation on ticket 1 of
+    3 silently cancelled tickets 2 and 3. If the graded file belonged to ticket 2,
+    the sprint scored "no code": indistinguishable from "the model cannot write
+    this", for work it was never asked to do. One hard file poisoned every easy
+    file queued behind it — in a project whose whole premise is MULTI-file
+    generation.
+    """
+    import asyncio
+
+    from multi_hive.nodes.execution.human_gate_node import human_gate_node
+
+    out = asyncio.run(
+        human_gate_node(
+            {
+                "editor_error": "boom",
+                "current_task": "the hard one",
+                "active_file": "outputs/hard.py",
+                "task_queue": [
+                    {"file": "outputs/easy.py", "task": "the easy one"},
+                    {"file": "src/util.py", "task": "a helper"},
+                ],
+                "loop_health": {"escalated": False},
+                "human_gate_event": None,
+            }
+        )
+    )
+
+    # The failed task is dropped; the rest of the work survives.
+    assert out["current_task"] == "the easy one"
+    assert out["active_file"] == "outputs/easy.py"
+    assert len(out["task_queue"]) == 1
+    assert out["editor_error"] is None  # cleared, so the next task starts fresh
+    assert out["editor_retries"] == 0
+
+
+def test_a_sprint_that_continues_past_the_gate_still_reports_escalated():
+    """
+    The failure this fix could have reintroduced, which is worse than the one it
+    fixes.
+
+    agent_router_node ZEROES loop_health at the start of each task — correctly, and
+    that reset is exactly what lets the sprint continue past a gate without routing
+    straight back to it. But it means `loop_health.escalated` is False by the time
+    the sprint ends, so a sprint that escalated on task 1 and then finished tasks 2
+    and 3 would report itself CLEAN.
+
+    A loop that gets stuck and never tells anyone is the worst failure in this
+    system. `sprint_escalated` is sticky and nothing clears it.
+    """
+    import asyncio
+
+    from multi_hive.nodes.execution.human_gate_node import human_gate_node
+
+    out = asyncio.run(
+        human_gate_node(
+            {
+                "editor_error": "boom",
+                "current_task": "the hard one",
+                "task_queue": [{"file": "outputs/easy.py", "task": "the easy one"}],
+                "loop_health": {"escalated": False},
+                "human_gate_event": None,
+            }
+        )
+    )
+    assert out["sprint_escalated"] is True
+
+    # ...and it survives the very reset that lets the sprint carry on.
+    from multi_hive.nodes.execution.agent_router_node import agent_router_node
+
+    after = agent_router_node({"current_task": "the easy one", "messages": []})
+    assert after["loop_health"]["escalated"] is False  # reset, so no gate loop
+    assert "sprint_escalated" not in after  # ...and the sticky flag is untouched
+
+
+def test_the_gate_still_ends_the_sprint_when_the_queue_is_empty():
+    """The original behaviour, for the single-task case that is now the norm."""
+    import asyncio
+
+    from multi_hive.nodes.execution.human_gate_node import human_gate_node
+    from multi_hive.orchestrator import gate_logic
+
+    out = asyncio.run(
+        human_gate_node(
+            {
+                "editor_error": "boom",
+                "current_task": "the only one",
+                "task_queue": [],
+                "loop_health": {"escalated": False},
+                "human_gate_event": None,
+            }
+        )
+    )
+    assert out["current_task"] is None
+    assert out["sprint_escalated"] is True
+    assert gate_logic(out) == "retrospector_node"

@@ -31,10 +31,17 @@ from multi_hive.core.utils import flush_file, safe_path
 
 def retrospector_node(state: dict[str, Any]) -> dict[str, Any]:
     project_files = state.get("project_files", {})
-    loop_health = state.get("loop_health") or {}
+    loop_health = dict(state.get("loop_health") or {})
     sprint_plan = state.get("sprint_plan", "")
     editor_error = state.get("editor_error")
     semantic_verdict = state.get("semantic_verdict")
+
+    # The sticky flag wins. agent_router_node zeroes loop_health at the start of
+    # each task, so a sprint that escalated on task 1 and then finished tasks 2 and
+    # 3 arrives here with `escalated=False` — and would have written a LOOP.md
+    # headed "CLEAN", burying the one thing the human gate exists to announce.
+    if state.get("sprint_escalated"):
+        loop_health["escalated"] = True
 
     # This sprint's wall time, computed from the start stamp the entrypoint put in
     # state. Not read from metrics.jsonl: that entry is written by cli.py *after*

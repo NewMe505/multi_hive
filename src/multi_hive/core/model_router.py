@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import re
 
-from multi_hive.config import ESCALATE_AFTER_FAILURES, FORCE_TIER
+from multi_hive.config import ESCALATE_AFTER_FAILURES, FORCE_TIER, PLAN_TIER
 
 FAST = "fast"
 STRONG = "strong"
@@ -121,3 +121,38 @@ def select_tier(
         return STRONG
 
     return FAST
+
+
+def select_plan_tier(objective: str | None) -> str:
+    """
+    Which tier drafts the plan and writes the tickets.
+
+    A separate decision from select_tier(), because it answers a different
+    question. select_tier asks "how hard is this code to WRITE, and has the fast
+    model already failed at it?" — a question about the editor, driven by retries.
+    This asks "how much do I care about getting the INTERPRETATION of the objective
+    right?", and there are no retries here: the plan is drafted once, before any
+    code exists, and everything downstream inherits it.
+
+    Precedence, and it matters:
+
+    1. FORCE_TIER — the operator pinned every tier. It outranks everything, because
+       a benchmark that is silently un-pinned by a routing rule is not a benchmark.
+    2. PLAN_TIER — the operator pinned *this* decision specifically.
+    3. The router, classifying the OBJECTIVE. Not a ticket — there is no ticket yet,
+       which is precisely what makes this the one node in the system still holding
+       the human's own words, before anything has summarised them.
+
+    Note what is NOT here: editor_retries. A ticket writer cannot be "retried into"
+    the strong model by a failing editor, because by the time the editor fails, the
+    ticket it is failing against has already been written. If the plan is wrong, the
+    ladder cannot climb its way out — it will just escalate a bigger model onto the
+    wrong task. That asymmetry is the whole argument for HIVE_PLAN_TIER=strong.
+    """
+    if FORCE_TIER in (FAST, STRONG):
+        return FORCE_TIER
+
+    if PLAN_TIER in (FAST, STRONG):
+        return PLAN_TIER
+
+    return select_tier(classify_complexity(objective))

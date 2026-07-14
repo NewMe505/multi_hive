@@ -163,3 +163,25 @@ class HiveState(TypedDict):
     # the same bet. It only ratchets up — see async_editor_node, which already
     # refuses to fall back once a task is on the strong tier.
     tier_floor: str | None
+    # True once ANY task in this sprint has been through the human gate. Sticky.
+    #
+    # loop_health.escalated cannot do this job, because agent_router_node zeroes
+    # loop_health at the start of every task — correctly, since a stale
+    # repeat_error_hash would otherwise trip an escalation on the first retry of an
+    # unrelated task. That same reset is what lets a sprint CONTINUE past a gate: it
+    # clears `escalated`, so reviewer_logic does not route straight back to the gate
+    # and spin.
+    #
+    # Which opens a hole. human_gate_node now skips the failed task and works the
+    # rest of the queue (it used to throw the queue away, silently cancelling every
+    # file behind the first hard one). Without a flag that survives the reset, a
+    # sprint could escalate on task 1, quietly finish tasks 2 and 3, and report
+    # itself CLEAN — hiding the one thing the human gate exists to announce.
+    #
+    # A loop that gets stuck and never tells anyone is the worst failure in this
+    # system. It would have been reintroduced, silently, by the fix for the
+    # second-worst.
+    #
+    # Set by human_gate_node. Cleared by nobody. Read by the three things that
+    # report an outcome: cli.py, retrospector_node, and bench/runner.py.
+    sprint_escalated: bool

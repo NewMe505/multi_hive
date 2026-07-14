@@ -223,6 +223,7 @@ async def run_sprint(
     final_semantic: str | None = None
     final_tier: str | None = None
     budget_exhausted = False
+    sprint_escalated = False
 
     # The governor's own total is cumulative for the process — that is what the
     # ceiling must be enforced against, since the supervisor runs many sprints and
@@ -251,6 +252,12 @@ async def run_sprint(
                     final_loop_health = state_delta["loop_health"] or {}
                 if "semantic_verdict" in state_delta:
                     final_semantic = state_delta["semantic_verdict"]
+                # Sticky, and it has to be. loop_health.escalated is RESET by
+                # agent_router_node when the sprint continues past a gate to the next
+                # task — so reading only the final loop_health would report a sprint
+                # that escalated on task 1 and finished tasks 2 and 3 as CLEAN.
+                if state_delta.get("sprint_escalated"):
+                    sprint_escalated = True
                 if state_delta.get("model_tier"):
                     tier = state_delta["model_tier"]
                     if tier != final_tier:
@@ -277,7 +284,11 @@ async def run_sprint(
     metrics.stop(llm_cache_size=llm_factory.cache_size())
 
     # ── Post-sprint panel ─────────────────────────────────────────────────────
-    escalated = final_loop_health.get("escalated", False)
+    # The sticky flag OR the final one. A sprint that escalated and then went on to
+    # finish the rest of the queue must still be reported as escalated — a human is
+    # needed either way, and a loop that gets stuck and does not say so is the worst
+    # failure in this system.
+    escalated = sprint_escalated or final_loop_health.get("escalated", False)
 
     if budget_exhausted:
         console.print(

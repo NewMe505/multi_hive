@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from langchain_core.messages import HumanMessage
+
 from multi_hive.core.model_router import classify_complexity, select_tier
 from multi_hive.state import default_loop_health
 
@@ -40,7 +42,26 @@ def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
     # objective that already escalated, because re-running a known failure on the
     # model that produced it is not a retry, it is the same bet. select_tier owns
     # the precedence (FORCE_TIER still wins over everything).
-    complexity = classify_complexity(state.get("current_task"))
+    #
+    # Classified from the OBJECTIVE AND THE TICKET, not the ticket alone.
+    #
+    # It used to read the ticket alone — which is the 7B ticket writer's paraphrase
+    # of a 7B planner's summary of what you asked for. So "start a hard task on the
+    # strong model" was firing on a summary, and every hard-task signal the human
+    # actually wrote ("O(1)", "full semver precedence", "thread-safe") had to
+    # survive two lossy rewrites by the very model the rule exists to route away
+    # from. It usually did not.
+    #
+    # The suite's own `complexity="hard"` label on semver and word_wrap was dead
+    # metadata for the same reason: nothing downstream ever read it, because the
+    # router re-derived complexity from the paraphrase instead.
+    #
+    # Both are read now. The objective carries the signal, the ticket carries the
+    # specifics, and a hard requirement only has to appear in one of them.
+    human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
+    objective = human_msgs[0].content if human_msgs else ""
+
+    complexity = classify_complexity(f"{objective}\n{state.get('current_task') or ''}")
     tier = select_tier(
         complexity,
         editor_retries=0,
