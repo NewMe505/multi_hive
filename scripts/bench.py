@@ -90,7 +90,20 @@ def _mark(passed: bool) -> str:
 # ── Suites ────────────────────────────────────────────────────────────────────
 
 
-def bench_models(models: list[str]) -> list[history.Run]:
+def bench_models(models: list[str], repeat: int = 1) -> list[history.Run]:
+    """
+    Each model, every task, `repeat` times — under the SAME strict rule as sprint.
+
+    `--repeat` used to be silently ignored here: every models number ever recorded
+    is a single sample. And those single samples were being read next to sprint's
+    strict pass-every-run aggregate, which is not a comparison, it is a category
+    error. The 30B's headline 4/4 is exactly that: at commit 18e4dab the same model
+    scored 3/4 with semver failing. Under sprint's own rule the 30B is 3/4.
+
+    A task passes only if it passes EVERY run. Same reason as _aggregate(): a task
+    that passes 2 of 3 has not been fixed, it has been made likely, and scoring it
+    as a win reports a coin landing heads.
+    """
     # This suite talks to Ollama's HTTP API directly, on purpose: its whole job is
     # answering "which local model should back a tier?", which is a question about
     # tok/s and GPU placement and has no meaning for a hosted API. To compare
@@ -108,17 +121,61 @@ def bench_models(models: list[str]) -> list[history.Run]:
     runs = []
     for model in models:
         print(f"\n{BOLD}=== {model} ==={RESET}", flush=True)
+        print(f"  {DIM}repeat={repeat}{RESET}", flush=True)
+
         run = history.Run(suite="models", subject=model).stamp()
+        # Part of the run's identity, so history.baseline_for never compares a
+        # strict x3 aggregate against an old single-run sample.
+        run.repeat = repeat
+
+        results: dict[str, list[dict]] = {task.name: [] for task in TASKS}
+
+        for rep in range(repeat):
+            if repeat > 1:
+                print(f"\n  {BOLD}run {rep + 1}/{repeat}{RESET}", flush=True)
+
+            for task in TASKS:
+                print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
+                result = runner.run_model(model, task)
+                results[task.name].append(result)
+
+                why = f"  {DIM}({result['failure']}){RESET}" if result["failure"] else ""
+                print(
+                    f"{result.get('tok_per_sec', 0):5.1f} tok/s  "
+                    f"{result['wall_sec']:6.1f}s  {_mark(result['passed'])}{why}"
+                )
+
+        flaky: list[str] = []
 
         for task in TASKS:
-            print(f"  {task.name:16} ({task.complexity:8}) ... ", end="", flush=True)
-            result = runner.run_model(model, task)
-            run.tasks.append(result)
+            reps = results[task.name]
+            if not reps:
+                continue
 
-            why = f"  {DIM}({result['failure']}){RESET}" if result["failure"] else ""
+            passes = sum(1 for r in reps if r["passed"])
+            failures = [r["failure"] for r in reps if r["failure"]]
+            if 0 < passes < len(reps):
+                flaky.append(f"{task.name} ({passes}/{len(reps)})")
+
+            run.tasks.append(
+                {
+                    "task": task.name,
+                    "complexity": task.complexity,
+                    "passed": passes == len(reps),  # reliably, not luckily
+                    "pass_rate": round(passes / len(reps), 3),
+                    "repeats": len(reps),
+                    "failure": failures[0][:120] if failures else "",
+                    "wall_sec": statistics.median([r["wall_sec"] for r in reps]),
+                    "tok_per_sec": statistics.median([r.get("tok_per_sec", 0) for r in reps]),
+                    "output_tokens": statistics.median([r.get("output_tokens", 0) for r in reps]),
+                    "gpu_placement": reps[0].get("gpu_placement", "?"),
+                }
+            )
+
+        if flaky:
             print(
-                f"{result.get('tok_per_sec', 0):5.1f} tok/s  "
-                f"{result['wall_sec']:6.1f}s  {_mark(result['passed'])}{why}"
+                f"\n  {BOLD}\033[33mFLAKY: {', '.join(flaky)}{RESET}\n"
+                f"  {DIM}Counted as NOT passed — `passed` means passed every run.{RESET}"
             )
 
         runs.append(run)
@@ -264,7 +321,20 @@ def _aggregate(results: dict[str, list[dict]], contract: bool, repeat: int) -> h
                 "nodes": statistics.median([r["nodes"] for r in runs]),
                 "tiers": runs[0]["tiers"],
                 "escalated_to_human": any(r["escalated_to_human"] for r in runs),
-                "contract_satisfied": any(r.get("contract_satisfied") for r in runs),
+                # all(), not any() — it must aggregate the same way `passed` does.
+                #
+                # With any(), a row could read contract_satisfied=True, passed=False
+                # assembled from two DIFFERENT repeats: the contract cleared in run
+                # 1, the hidden suite failed in run 3. That is the exact signature of
+                # [CONTRACT GAMED] — the one outcome that would invalidate the whole
+                # acceptance-contract approach — manufactured out of ordinary
+                # flakiness, with no gaming anywhere. A gaming detector that cries
+                # wolf gets ignored, and then it is not a detector.
+                #
+                # The per-run alarm below is unaffected: it correlates
+                # contract_satisfied and passed WITHIN a single run, which is the
+                # only place the correlation means anything.
+                "contract_satisfied": all(r.get("contract_satisfied") for r in runs),
                 "failure": failures[0][:120] if failures else "",
             }
         )
@@ -402,7 +472,7 @@ def main() -> None:
         raise SystemExit("--repeat must be at least 1")
 
     runs = (
-        bench_models(args.models)
+        bench_models(args.models, repeat=args.repeat)
         if args.suite == "models"
         else bench_sprint(contract=args.contract, repeat=args.repeat)
     )

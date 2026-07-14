@@ -34,8 +34,19 @@ def agent_router_node(state: dict[str, Any]) -> dict[str, Any]:
     # A fresh task starts on the fast model unless it looks hard up front —
     # retries are what escalate it, and this node only ever runs at the start
     # of a task, so retries are 0 by definition here.
+    #
+    # ...which is true of this *process* and false of the *work*. tier_floor is how
+    # a previous sprint's evidence survives: discovery sets it when replaying an
+    # objective that already escalated, because re-running a known failure on the
+    # model that produced it is not a retry, it is the same bet. select_tier owns
+    # the precedence (FORCE_TIER still wins over everything).
     complexity = classify_complexity(state.get("current_task"))
-    tier = select_tier(complexity, editor_retries=0, repeat_error=False)
+    tier = select_tier(
+        complexity,
+        editor_retries=0,
+        repeat_error=False,
+        tier_floor=state.get("tier_floor"),
+    )
 
     # loop_health resets at the start of every task: a repeat_error_hash left
     # over from the previous task would otherwise trip an escalation on the

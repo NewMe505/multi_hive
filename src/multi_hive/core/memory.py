@@ -35,6 +35,47 @@ def log_rejection(node_name: str, error_msg: str) -> None:
         f.write(json.dumps({"node": node_name, "error": error_msg}) + "\n")
 
 
+def get_escalations() -> list[dict]:
+    """
+    The structured ESCALATION records this sprint logged, newest last.
+
+    `human_gate_node` writes each escalation as a JSON payload — task, file,
+    retries, repeat_error hash, error preview — into the ledger. It was the only
+    place in the system that recorded *why* the hive got stuck, and nothing ever
+    read it back: `clear_ledger()` runs at the start of the next sprint and
+    deleted it.
+
+    This is that read. Call it at the END of a sprint, while the ledger still
+    holds this sprint's entries, and hand the result to the journal — which,
+    unlike the ledger, survives.
+
+    Non-ESCALATION entries (plain error strings, gate timeouts) are skipped: the
+    node logs both, and only the structured ones are replayable.
+    """
+    if not LEDGER_FILE.exists():
+        return []
+
+    escalations: list[dict] = []
+    with LEDGER_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("node") != "human_gate_node":
+                continue
+            try:
+                payload = json.loads(entry.get("error", ""))
+            except (json.JSONDecodeError, TypeError):
+                continue  # a gate-timeout line, not a structured escalation
+            if isinstance(payload, dict) and payload.get("type") == "ESCALATION":
+                escalations.append(payload)
+
+    return escalations
+
+
 def get_recent_rejections(node_name: str, limit: int = 3) -> str:
     """
     The last `limit` failures logged by `node_name`, newest last, each capped

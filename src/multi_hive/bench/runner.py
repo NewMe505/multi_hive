@@ -17,17 +17,79 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
 from typing import Any
 
 import requests
 
 from multi_hive.bench.suite import Task, grade
-from multi_hive.config import OUTPUTS_DIR, RECURSION_LIMIT, ensure_workspace
+from multi_hive.config import OUTPUTS_DIR, RECURSION_LIMIT, SRC_DIR, ensure_workspace
 from multi_hive.contract import normalise_target
+from multi_hive.core.memory import clear_ledger
 from multi_hive.prompts import get_editor_prompt
 
 OLLAMA = "http://127.0.0.1:11434"
+
+
+def clean_workspace() -> None:
+    """
+    A benchmark task starts from an empty workspace and an empty ledger.
+
+    Neither used to be true, and between them they corrupted every sprint number
+    this project has ever recorded.
+
+    The ledger
+    ----------
+    `clear_ledger()` had exactly one caller in the codebase — `cli.py` — so a
+    benchmark run never cleared it. And `get_recent_rejections()` filters by NODE
+    NAME ONLY: no task scoping, no run scoping. It returns the last three failures
+    for that node *from the whole file*.
+
+    So the `word_wrap` editor was handed `semver`'s traceback under the heading
+    "PAST RUNTIME/ASSERTION FAILURES — your code ran but produced wrong results.
+    Fix the logic" and told to fix a bug in a file it was not writing. The ledger
+    was found 221 lines deep, spanning multiple tasks and multiple sessions.
+
+    Three consequences, all of which invalidate the measurement:
+
+    - **The suite was order-dependent.** Task 4 carried tasks 1-3's failures into
+      its context. Task 1 carried none. Reordering TASKS changed the score.
+    - **The repeats were not independent.** Run 2 began with run 1's failures in
+      the editor's prompt — which voids the entire point of `passed == passed
+      every run`, a rule this benchmark otherwise defends very carefully.
+    - **A run was not reproducible from a clean checkout.** The score depended on
+      ledger residue from whatever was run yesterday.
+
+    And `run_model` never touches the ledger, so the whole penalty applied to
+    `sprint` and never to `models` — a one-directional bias in precisely the
+    comparison the two suites exist to support.
+
+    The workspace
+    -------------
+    Only the graded artefact was unlinked. Everything else survived. The reviewer
+    sandbox runs with `PYTHONPATH=WORKSPACE_DIR` and its cwd inside the workspace,
+    so a module left behind by an earlier task could shadow an import and let a
+    task pass on *yesterday's code*.
+
+    What is deleted, and what is not
+    --------------------------------
+    Generated code is `*.py`. The hive's own records are not — `bench_history.jsonl`
+    above all, which is the file the benchmark exists to write, and wiping it to
+    clean the workspace would be an own goal of a high order. So this removes
+    Python and bytecode and leaves every `.jsonl` / `.md` / `.json` alone.
+    """
+    ensure_workspace()
+
+    for root in (SRC_DIR, OUTPUTS_DIR):
+        # Materialise before mutating — rglob is lazy, and deleting out from under
+        # it is how you get a walker that skips half the tree.
+        for path in list(root.rglob("*.py")):
+            path.unlink(missing_ok=True)
+        for cache in list(root.rglob("__pycache__")):
+            shutil.rmtree(cache, ignore_errors=True)
+
+    clear_ledger()
 
 
 def _extract_code(raw: str) -> str:
@@ -125,12 +187,12 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
     from multi_hive.orchestrator import hive_app
     from multi_hive.state import default_loop_health
 
-    ensure_workspace()
+    # Empty workspace, empty ledger. Not a tidy-up — a correctness requirement.
+    # See clean_workspace(): without it the suite is order-dependent, the repeats
+    # are not independent samples, and the run is not reproducible.
+    clean_workspace()
 
     artefact = OUTPUTS_DIR / task.filename
-    if artefact.exists():
-        artefact.unlink()  # never grade a previous run's leftovers
-
     target = f"outputs/{task.filename}"
 
     initial = {

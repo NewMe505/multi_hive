@@ -11,7 +11,194 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The benchmark was contaminated, and every sprint number this project has ever
+  recorded was taken through a dirty lens.**
+
+  `clear_ledger()` had exactly one caller in the codebase — `cli.py` — so a bench
+  run never cleared it. And `get_recent_rejections()` filters by **node name only**:
+  no task scoping, no run scoping. It returns the last three failures for that node
+  *from the whole file*.
+
+  So the `word_wrap` editor was handed `semver`'s traceback, under the heading
+  "PAST RUNTIME/ASSERTION FAILURES — your code ran but produced wrong results. Fix
+  the logic", and told to fix a bug in a file it was not writing. The ledger was
+  found **221 lines deep, spanning multiple tasks and multiple sessions.**
+
+  Three consequences, each of which invalidates the measurement:
+
+  - **The suite was order-dependent.** Task 4 carried tasks 1–3's failures into its
+    context; task 1 carried none. Reordering `TASKS` changed the score.
+  - **The repeats were not independent samples.** Run 2 began with run 1's failures
+    already in the editor's prompt — which voids the entire point of
+    `passed == passed every run`, the rule this benchmark otherwise defends more
+    carefully than anything else in it.
+  - **A run was not reproducible from a clean checkout.** The score depended on
+    ledger residue from whatever was run yesterday.
+
+  And `run_model` never touches the ledger, so the whole penalty fell on `sprint`
+  and never on `models` — a one-directional bias in precisely the comparison the
+  two suites exist to support. `bench/runner.clean_workspace()` now empties the
+  ledger and removes generated `*.py` and `__pycache__` before every task. The
+  hive's own records (`bench_history.jsonl` above all) are deliberately left alone.
+
+- **Only the graded artefact was cleaned between tasks.** Everything else survived,
+  and the reviewer sandbox runs with `PYTHONPATH=WORKSPACE_DIR` — so a module left
+  behind by an earlier task could shadow an import and let a task pass on
+  *yesterday's code*. The whole workspace is now cleaned.
+
+- **`--repeat` was silently ignored by the `models` suite.** Every models number
+  ever recorded is a single sample, and those samples were being read next to
+  sprint's strict pass-every-run aggregate — which is not a comparison, it is a
+  category error. `models` now honours `--repeat` and applies the same rule.
+  Expect the 30B to settle at **3/4, not the 4/4 that has been quoted**: at commit
+  `18e4dab` it already scored 3/4 with `semver` failing. The 4/4 was a coin landing
+  heads.
+
+- **The `[CONTRACT GAMED]` detector could cry wolf.** `_aggregate` stored
+  `contract_satisfied` with `any()` while `passed` used `all()`, so a row could
+  read `contract_satisfied=True, passed=False` assembled from two *different*
+  repeats — the exact gaming signature, manufactured out of ordinary flakiness with
+  no gaming anywhere. It aggregates with `all()` now. A detector that cries wolf
+  gets ignored, and then it is not a detector.
+
+- **The regression gate fired on task-count changes, not regressions.**
+  `quality_regression` was `quality_delta < 0` — a raw count difference. Add a task
+  to `TASKS` and every later run looks like an improvement; remove one and every
+  later run looks like a regression. It is now driven by `regressed_tasks`, matched
+  by name over the shared set, so it survives the suite growing or shrinking — and
+  when it fires it names the task that broke.
+
+### Fixed
+
+- **The planner could hand the graph a file it was never allowed to write, and the
+  hive would spend its entire retry budget failing to.** Model-authored paths were
+  validated at the *write* boundary (`safe_path`) and nowhere else — so an illegal
+  path was only caught after a full generation had been paid for against it.
+
+  Worse than the wasted inference was where the error went. `reviewer_node` raised
+  `FILE SYSTEM ERROR: Path traversal blocked: 'test_add.py'`, that became an
+  `editor_error`, and the editor was handed it with *"FIX THE CODE SO IT PASSES."*
+  But the code was never wrong. The **path** was wrong, and the path lives in
+  `active_file`, which the editor cannot change. No output the model can produce
+  fixes it — so every retry regenerated the same file for the same illegal path,
+  failed identically, burned `MAX_RETRIES`, and escalated to a human for a problem
+  no human was needed for. Observed live on a two-line `add(a, b)`: four
+  generations and an escalation, for a task the 7B solves first try.
+
+  `core/utils.normalise_model_path()` is now the **entry** boundary, enforced in
+  `ticket_writer` across the whole queue (not just `tasks[0]` — every path in it
+  becomes `active_file` eventually, as `semantic_reviewer_node` retires tasks, so
+  validating only the first would have moved the bug deeper into the sprint where
+  it costs more).
+
+  It widens exactly one case: a **bare filename** has no directory component, so
+  the model's intent is not in question — it meant a workspace file and forgot to
+  say where — and `outputs/` is deterministic, not a guess. **Everything else
+  `safe_path` would refuse is still refused.** A traversal has a directory
+  component, so it is not a bare filename, so it falls straight through to
+  `safe_path` and is rejected: normalisation must never launder a path, and
+  `tests/test_safe_path.py` pins that. Unfixable tickets are dropped and logged; a
+  plan with no writable file at all now fails loudly instead of spinning.
+
+  Both outcomes log under `ticket_writer`, which none of the editor's three failure
+  feeds read. Handing the editor a routing complaint and telling it to "fix the
+  code structure" is the same category error the repeat-error breaker was already
+  taught once.
+
+  The ticket-writer prompt now names the failure explicitly too — but the prompt
+  already said "paths must start with 'src/' or 'outputs/'" and the model emitted
+  `test_add.py` anyway. A prompt is not a guarantee. That is why this is enforced
+  in code.
+
 ### Added
+
+- **The hive runs itself.** `multi-hive --loop` discovers its own work, does it,
+  writes down what happened, and repeats — until the backlog is empty or the
+  budget is gone. `multi-hive --digest` shows what it did while you were asleep.
+
+  Everything below the loop already existed: the sprint, the two reviewers, the
+  escalation ladder, the human gate. What was missing was everything *above* it.
+  Every objective the hive had ever run was typed by a human into a REPL, which
+  made the human the bottleneck, and the bottleneck was the boring part.
+
+  Four pieces, and the order they landed in is the whole design:
+
+  1. **The governor** (below) — because you do not build the thing that runs
+     unattended until the thing that stops it exists.
+  2. **`core/journal.py`** — append-only, never cleared, survives the sprint.
+     `human_gate_node` has always recorded *why* the hive got stuck; nothing ever
+     read it, because `clear_ledger()` deletes the ledger at the start of the next
+     sprint. The hive knew how to say "I got stuck here, on this, for this reason"
+     and then threw it away. A record of unfinished work is a backlog.
+  3. **`discovery.py`** — that backlog, read back. Escalated-and-unresolved sprints
+     become the next run's queue.
+  4. **`supervisor.py`** — discover, work, journal, repeat.
+
+  **A replay is not a re-run.** `agent_router_node` seeds every fresh task with
+  `select_tier(editor_retries=0)`, which returns *fast* — so a rediscovered
+  objective would have run on the exact model that already failed it and
+  reproduced the identical failure, at machine speed, reported as progress. A
+  discovered item therefore carries `tier_floor=STRONG`: the fast model has
+  demonstrably failed this task, and another attempt from it is the same bet. That
+  is the escalation ladder's own logic, carried across sprints instead of thrown
+  away at the end of each one. `HIVE_FORCE_TIER` still outranks it — a benchmark
+  that is silently un-pinned by a routing rule is not a benchmark.
+
+  **It provably stops.** Three independent bounds, and they are independent on
+  purpose: the governor; the attempt cap (`HIVE_MAX_DISCOVERY_ATTEMPTS`, default 2
+  — the original run plus exactly one retry on the tier that has not yet failed);
+  and a progress check. The one that actually bites is the third: a *crashing*
+  sprint writes no journal record, so the attempt counter never advances, so
+  discovery hands back the same item forever — a tight, free, infinite loop that
+  spends no tokens and therefore never troubles the governor. The supervisor
+  journals crashes itself so the counter is monotonic, and keeps its own in-process
+  memory of what it has run so termination does not depend on a disk write landing.
+
+  **`HIVE_MAX_DISCOVERY_ATTEMPTS` is the open door for human review**, held open by
+  a counter rather than by anyone's good intentions at 3am. Work that beats the
+  ladder is *parked* and surfaced loudly in the digest — a loop that silently stops
+  trying looks exactly like a loop with nothing to do, and the difference matters
+  enormously to whoever reads it.
+
+  The digest ends by naming one machine-written file and asking you to go read it.
+  That is not decoration. Comprehension rot and cognitive surrender have no clever
+  engineering fix; the only defense is to read the machine's output and be able to
+  explain it, and the digest exists to make that cheap, not to make it optional.
+
+- **A budget governor — the thing that can say stop.** `core/governor.py` meters
+  every model call and raises `BudgetExhausted` at a ceiling: `HIVE_MAX_USD`,
+  `HIVE_MAX_TOKENS`, `HIVE_MAX_WALL_SEC`, `HIVE_MAX_SPRINTS`. The USD cap defaults
+  to **$5 on the anthropic provider** and to unlimited on Ollama, where tokens are
+  free and a cap would only surprise people.
+
+  `MAX_RETRIES`, `RECURSION_LIMIT` and the repeat-error fingerprint are per-sprint
+  backstops; none of them is a *cost* ceiling, and until now there was no token
+  accounting anywhere in the system. That was fine for as long as inference was
+  free and a human was watching. It is neither once `HIVE_PROVIDER=anthropic` meets
+  an unattended loop — and the escalation ladder is what makes it sharp: haiku is
+  $1/$5 per Mtok, fable is $10/$50, and the ladder climbs to the expensive tier
+  *precisely when a task is failing*, which is when the loop spends the most and
+  produces the least.
+
+  Two properties are load-bearing. **The ceiling is checked before a call, not
+  after** — `on_llm_start` raises, `on_llm_end` records — so the governor can
+  overshoot by at most one call rather than by an unbounded number; enforcing it
+  only on the way out would produce an audit log that faithfully records every
+  dollar it failed to prevent. And **an unpriced model is charged at the most
+  expensive rate we know**, because a budget guard that fails open is not a budget
+  guard.
+
+  The meter hangs off `llm_factory`, the one module permitted to construct a
+  client — which is what makes it the only place it *can* hang such that no call
+  escapes it.
+
+- **`docs/LOOP_ENGINEERING.md`** — the layer above the graph: what it takes for
+  the hive to run with no human pressing Enter, and what it costs when it does.
+  Scores the system honestly, including the finding that its judgment layer was
+  already ahead of the framework it is scored against, and that the layer above it
+  did not exist.
 
 - **`HIVE_PROVIDER` — run the hive on the Claude API instead of local Ollama.**
   `HIVE_PROVIDER=anthropic` swaps the fast/strong tiers for `claude-haiku-4-5` and

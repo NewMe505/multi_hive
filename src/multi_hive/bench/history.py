@@ -201,7 +201,22 @@ class Comparison:
 
     @property
     def quality_regression(self) -> bool:
-        return self.quality_delta < 0
+        """
+        A regression is a task that USED TO PASS and does not any more. By name.
+
+        This used to be `quality_delta < 0` — a raw count difference — and a count
+        is not a fact about behaviour. Add a task to TASKS and every later run looks
+        like an improvement; remove one and every later run looks like a regression.
+        The gate would fire, or fail to fire, for reasons that have nothing to do
+        with the code under test, which is the one thing a CI gate must never do.
+
+        `regressed_tasks` is matched by name over the shared set, so it survives the
+        suite growing or shrinking — and when it fires it can say *which task broke*
+        instead of only that a number went down.
+
+        `quality_delta` is kept for the summary line. It is a headline, not a gate.
+        """
+        return bool(self.regressed_tasks)
 
     @property
     def speed_regression(self) -> bool:

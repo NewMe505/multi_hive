@@ -130,6 +130,55 @@ SANDBOX_TIMEOUT_SEC = int(os.environ.get("HIVE_SANDBOX_TIMEOUT", "10"))
 # Cap on raw user input before it reaches any LLM context window.
 MAX_INPUT_CHARS = int(os.environ.get("HIVE_MAX_INPUT_CHARS", "4000"))
 
+# ── Budget governor ───────────────────────────────────────────────────────────
+#
+# MAX_RETRIES, RECURSION_LIMIT and the repeat-error fingerprint are *per-sprint*
+# backstops. None of them is a cost ceiling, and that was fine for exactly as
+# long as the hive only ever ran on local Ollama, where inference is free and a
+# human is watching it happen.
+#
+# The anthropic provider changes the arithmetic, and the escalation ladder is
+# what makes it sharp: haiku is $1/$5 per Mtok, fable is $10/$50. The ladder
+# climbs to the expensive tier precisely when a task is failing — i.e. when the
+# loop is spending the most and producing the least. Run that unattended on a
+# schedule and there is nothing in the system able to say stop.
+#
+# So: a real ceiling, on by default where money is at stake. Zero means no cap.
+#
+#   HIVE_MAX_USD        spend ceiling for the process. Defaults to $5 on the
+#                       anthropic provider and to *unlimited* on ollama, where
+#                       the tokens cost nothing and a cap would only surprise
+#                       people.
+#   HIVE_MAX_TOKENS     total (input + output) token ceiling. Off by default —
+#                       it is the useful cap when the provider is free but the
+#                       loop can still spin, and the supervisor sets one.
+#   HIVE_MAX_WALL_SEC   wall-clock ceiling for the process.
+#   HIVE_MAX_SPRINTS    how many sprints one supervisor run may execute.
+#
+# See core/governor.py — the ceilings are checked *before* each model call, not
+# after. A check that fires once the tokens are already spent is an audit log,
+# not a cap.
+
+_DEFAULT_MAX_USD = "5.00" if PROVIDER == "anthropic" else "0"
+
+MAX_USD = float(os.environ.get("HIVE_MAX_USD", _DEFAULT_MAX_USD))
+MAX_TOKENS = int(os.environ.get("HIVE_MAX_TOKENS", "0"))
+MAX_WALL_SEC = float(os.environ.get("HIVE_MAX_WALL_SEC", "0"))
+MAX_SPRINTS = int(os.environ.get("HIVE_MAX_SPRINTS", "0"))
+
+# ── Discovery ─────────────────────────────────────────────────────────────────
+#
+# How many times any one work item may be run — by anyone, human or loop — before
+# discovery stops picking it up and PARKS it for a human.
+#
+# 2 is the deliberate default: the original attempt, plus exactly one machine
+# retry on the tier that has not yet failed it. If the strong model escalates it
+# too, the ladder is out of rungs and a third automated attempt is not a retry,
+# it is a nodding loop with extra steps.
+#
+# The counter is what keeps the open door for human review from quietly closing.
+MAX_DISCOVERY_ATTEMPTS = int(os.environ.get("HIVE_MAX_DISCOVERY_ATTEMPTS", "2"))
+
 # ── Workspace layout ──────────────────────────────────────────────────────────
 
 WORKSPACE_DIR = Path(os.environ.get("HIVE_WORKSPACE", "workspace")).resolve()
@@ -144,6 +193,22 @@ ALLOWED_DIRS: tuple[Path, ...] = (SRC_DIR, OUTPUTS_DIR)
 LEDGER_FILE = OUTPUTS_DIR / "rejection_ledger.jsonl"
 METRICS_FILE = OUTPUTS_DIR / "metrics.jsonl"
 LOOP_MD_FILE = OUTPUTS_DIR / "LOOP.md"
+
+# Append-only spend record. Unlike LEDGER_FILE this is NEVER cleared: it is the
+# audit trail for what the loop cost, and a loop that forgets what it spent is
+# the one that spends it again.
+SPEND_FILE = OUTPUTS_DIR / "spend.jsonl"
+
+# The cross-sprint journal. Also never cleared — that is the entire point of it.
+#
+# LEDGER_FILE is wiped at the start of every sprint (clear_ledger), which is right
+# for what it is: the editor's memory of the mistakes it made on *this* task. But
+# it means that until now nothing the hive learned outlived the sprint that
+# learned it. The escalations human_gate_node so carefully records were deleted
+# before the next run could ever read them.
+#
+# The journal is what survives. See core/journal.py.
+JOURNAL_FILE = OUTPUTS_DIR / "journal.jsonl"
 
 
 def ensure_workspace() -> None:

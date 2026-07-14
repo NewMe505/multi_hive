@@ -147,3 +147,19 @@ class HiveState(TypedDict):
     sprint_started_at: float | None
     # asyncio.Event — injected per sprint, not checkpointed.
     human_gate_event: Any | None
+    # "strong", or None. A tier the router may not go BELOW for this sprint.
+    #
+    # Set by the entrypoint, never by a node, and it exists for one caller:
+    # discovery.py, replaying a sprint that escalated last time.
+    #
+    # Without it a rediscovered objective is a no-op. agent_router_node seeds every
+    # fresh task with select_tier(..., editor_retries=0), which returns "fast" —
+    # so the retry would run on the exact model that already failed the task and
+    # reproduce the identical failure. The loop would re-do known-broken work at
+    # machine speed and call it progress.
+    #
+    # The floor is the escalation ladder's own logic, carried across sprints: the
+    # fast model has demonstrably failed this task, so another attempt from it is
+    # the same bet. It only ratchets up — see async_editor_node, which already
+    # refuses to fall back once a task is on the strong tier.
+    tier_floor: str | None

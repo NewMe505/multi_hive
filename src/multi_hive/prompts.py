@@ -68,7 +68,9 @@ def get_ticket_writer_prompt() -> str:
         "3. FILE PATH RULE: If the User Objective specifies an explicit output path "
         "(e.g. 'Save it to outputs/dsp_pipeline.py'), you MUST use that exact path "
         "in the 'file' field. Do not invent a different filename.\n"
-        "4. All file paths must start with 'src/' or 'outputs/'.\n"
+        "4. Every 'file' MUST start with 'src/' or 'outputs/'. A bare filename "
+        "like 'test_add.py' is NOT a valid path — write 'outputs/test_add.py'. "
+        "A ticket naming any other location is discarded and its work is lost.\n"
         'Example: [{"file": "outputs/dsp_pipeline.py", "task": "Implement DSP module"}, '
         '{"file": "src/main.py", "task": "Import and run"}]'
     )

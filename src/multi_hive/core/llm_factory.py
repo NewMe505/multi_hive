@@ -45,6 +45,7 @@ import os
 from typing import Any
 
 from multi_hive.config import MODELS, PROVIDER
+from multi_hive.core import governor
 
 _sync_cache: dict[tuple[str, str], Any] = {}
 
@@ -145,8 +146,15 @@ def _build(purpose: str, tier: str) -> Any:
     Both imports are deferred. langchain_anthropic is an optional dependency, and
     an Ollama-only user must not be forced to install it — nor should an import
     error from a package they never asked for be the first thing they see.
+
+    Every client is built with the governor's meter attached. This module is the
+    only one allowed to construct a client, which makes it the only place the
+    meter *can* be attached such that no call escapes it — a node that built its
+    own client would not just ignore HIVE_PROVIDER (which is why the rule exists),
+    it would now also spend money nothing is counting.
     """
     kwargs = _resolve(purpose, tier)
+    kwargs["callbacks"] = [governor.meter(kwargs["model"])]
 
     if PROVIDER == "anthropic":
         if not os.environ.get("ANTHROPIC_API_KEY"):

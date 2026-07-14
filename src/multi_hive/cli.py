@@ -40,7 +40,9 @@ import contextlib
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from langchain_core.messages import HumanMessage
 from rich.panel import Panel
@@ -53,9 +55,10 @@ from multi_hive.config import (
     ensure_workspace,
 )
 from multi_hive.contract import ContractError, assert_count, parse_objective
-from multi_hive.core import llm_factory
+from multi_hive.core import governor, journal, llm_factory
 from multi_hive.core.console import console
-from multi_hive.core.memory import clear_ledger
+from multi_hive.core.governor import BudgetExhausted
+from multi_hive.core.memory import clear_ledger, get_escalations
 from multi_hive.core.metrics import SprintMetrics
 from multi_hive.orchestrator import hive_app
 from multi_hive.state import HiveState, default_loop_health
@@ -127,7 +130,33 @@ async def _acknowledge_on_input(broker: StdinBroker, gate_event: asyncio.Event) 
             return
 
 
-async def run_sprint(user_input: str, broker: StdinBroker) -> None:
+@dataclass
+class SprintOutcome:
+    """
+    What one sprint did, for whoever is driving it.
+
+    `run_sprint` used to return None, which was fine when the only caller was a
+    human at a REPL who could read the panel. The supervisor cannot read a panel.
+    """
+
+    key: str
+    status: str  # journal.CLEAN | journal.ESCALATED | journal.FAILED
+    error: str | None = None
+    tier: str | None = None
+    budget_exhausted: bool = False
+    wall_time: float = 0.0
+    escalations: list[dict[str, Any]] = field(default_factory=list)
+    spend: dict[str, Any] = field(default_factory=dict)
+
+
+async def run_sprint(
+    user_input: str,
+    broker: StdinBroker,
+    *,
+    source: str = journal.SOURCE_HUMAN,
+    attempt: int = 1,
+    tier_floor: str | None = None,
+) -> SprintOutcome:
     clear_ledger()
 
     # The objective handed to the planner is the one with the ACCEPTANCE blocks
@@ -183,6 +212,7 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
         "contract_satisfied": None,
         "sprint_started_at": time.monotonic(),
         "human_gate_event": gate_event,
+        "tier_floor": tier_floor,
     }
 
     metrics = SprintMetrics()
@@ -192,6 +222,13 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
     final_loop_health: dict = {}
     final_semantic: str | None = None
     final_tier: str | None = None
+    budget_exhausted = False
+
+    # The governor's own total is cumulative for the process — that is what the
+    # ceiling must be enforced against, since the supervisor runs many sprints and
+    # the point is that they add up. The journal wants *this* sprint's cost, so
+    # bracket the run and diff across it.
+    spend_before = governor.current().snapshot()
 
     ack_task = asyncio.create_task(_acknowledge_on_input(broker, gate_event))
 
@@ -224,6 +261,14 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
                     final_tier = tier
                 metrics.record_node(node_name)
                 console.print(f"🔄 [bold cyan]{node_name}[/] executed.")
+    except BudgetExhausted as e:
+        # The governor stopped the run. This is the ONE place a budget stop is
+        # caught, and it is caught here rather than in a node on purpose: a node's
+        # `except Exception` would have turned it into an editor_error and retried
+        # it, spinning against a dead budget and then blaming the model. See the
+        # BudgetExhausted docstring — it is a BaseException so that cannot happen.
+        budget_exhausted = True
+        final_error = f"BUDGET EXHAUSTED: {e}"
     finally:
         ack_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -234,7 +279,18 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
     # ── Post-sprint panel ─────────────────────────────────────────────────────
     escalated = final_loop_health.get("escalated", False)
 
-    if escalated:
+    if budget_exhausted:
+        console.print(
+            Panel(
+                f"[bold yellow]💸 Sprint Halted — Budget Exhausted[/]\n"
+                f"[dim]{final_error}[/]\n\n"
+                f"[dim]Nothing was retried: the ceiling is enforced before a call, so no\n"
+                f"tokens were spent on the attempt that was refused. Raise the cap\n"
+                f"(HIVE_MAX_USD / HIVE_MAX_TOKENS) or start a fresh process.[/]",
+                border_style="yellow",
+            )
+        )
+    elif escalated:
         console.print(
             Panel(
                 f"[bold red]🚨 Sprint Escalated in {metrics.wall_time:.1f}s[/]\n"
@@ -259,6 +315,30 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
             )
         )
 
+    # ── Journal ───────────────────────────────────────────────────────────────
+    #
+    # Harvest the escalations BEFORE the next sprint's clear_ledger() deletes
+    # them. human_gate_node has always written this record; nothing has ever read
+    # it, because the ledger is wiped at the start of every sprint. This is the
+    # read, and the journal is where it goes to survive.
+    escalations = get_escalations()
+    spend = governor.spend_since(spend_before)
+
+    status = (
+        journal.ESCALATED if escalated else journal.FAILED if final_error else journal.CLEAN
+    )
+
+    journal.record_sprint(
+        objective=user_input,  # raw, contracts included — this is the replay payload
+        status=status,
+        tier=final_tier,
+        escalations=escalations,
+        spend=spend,
+        source=source,
+        attempt=attempt,
+        wall_time_sec=metrics.wall_time,
+    )
+
     console.print(
         f"[dim]nodes={metrics.node_count}  "
         f"peak_rss_mb={metrics.peak_rss_mb:.1f}  "
@@ -266,7 +346,20 @@ async def run_sprint(user_input: str, broker: StdinBroker) -> None:
         f"attempts={final_loop_health.get('attempt_count', 0)}  "
         f"escalated={escalated}  "
         f"tier={final_tier or '—'}  "
-        f"semantic={final_semantic or '—'}[/]"
+        f"semantic={final_semantic or '—'}  "
+        f"tokens={spend['total_tokens']}  "
+        f"cost=${spend['usd']:.4f}[/]"
+    )
+
+    return SprintOutcome(
+        key=journal.key_for(user_input),
+        status=status,
+        error=final_error,
+        tier=final_tier,
+        budget_exhausted=budget_exhausted,
+        wall_time=metrics.wall_time,
+        escalations=escalations,
+        spend=spend,
     )
 
 
@@ -375,10 +468,44 @@ def run() -> None:
             "The file may carry ACCEPTANCE contract blocks; see contract.py."
         ),
     )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help=(
+            "run unattended: discover work from the hive's own escalations, work "
+            "it, repeat, until the backlog is empty or the budget is spent. "
+            "Set HIVE_MAX_USD / HIVE_MAX_TOKENS before pointing this at a paid "
+            "provider. See supervisor.py."
+        ),
+    )
+    parser.add_argument(
+        "--watch",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help=(
+            "with --loop: when the backlog is empty, wait SEC and look again "
+            "instead of exiting."
+        ),
+    )
+    parser.add_argument(
+        "--digest",
+        action="store_true",
+        help="print what the loop has been doing, then exit. Read it.",
+    )
     args = parser.parse_args()
 
+    # Imported here, not at module scope: supervisor imports run_sprint from this
+    # module, and a top-level import would be a cycle.
+    from multi_hive import supervisor
+
     try:
-        asyncio.run(main(args.objective))
+        if args.digest:
+            supervisor.digest()
+        elif args.loop:
+            asyncio.run(supervisor.run(watch_sec=args.watch))
+        else:
+            asyncio.run(main(args.objective))
     except KeyboardInterrupt:
         console.print("\n[dim]^C — Shutting down.[/]")
 

@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from multi_hive import prompts
 from multi_hive.core.llm_factory import get_llm
 from multi_hive.core.memory import log_rejection
+from multi_hive.core.utils import normalise_model_path
 
 
 def _extract_task_list(raw_text: str) -> list[dict]:
@@ -39,6 +40,57 @@ def _extract_task_list(raw_text: str) -> list[dict]:
         and isinstance(t.get("file"), str)
         and isinstance(t.get("task"), str)
     ]
+
+
+def _legalise_paths(tasks: list[dict]) -> list[dict]:
+    """
+    Forces every ticket's path inside the workspace, dropping the ones that cannot
+    be.
+
+    This is the boundary. Every path in the queue ends up in `active_file` — the
+    first one immediately, the rest as semantic_reviewer_node retires tasks and
+    pulls the next — so validating only `tasks[0]` would just move the bug later
+    into the sprint, where it is more expensive.
+
+    Getting it wrong is not a style question. An illegal path is only caught at
+    write time, by which point a full generation has been paid for, and the
+    resulting `FILE SYSTEM ERROR` is routed back to the editor as though it were a
+    code failure. It is not: the path lives in state and the editor cannot change
+    it. Every retry regenerates the same file for the same illegal path, fails
+    identically, and burns the whole retry budget before escalating to a human for
+    a problem no human was needed for.
+
+    Both outcomes are logged under "ticket_writer" and not under any of the three
+    node names the editor's failure feeds read from. The editor must not be handed
+    a routing complaint and told to "fix the code structure" — that is a category
+    error the repeat-error breaker has already been taught once.
+    """
+    legal: list[dict] = []
+
+    for task in tasks:
+        original = task["file"]
+        normalised = normalise_model_path(original)
+
+        if normalised is None:
+            log_rejection(
+                "ticket_writer",
+                f"DROPPED TICKET — {original!r} resolves outside workspace/src and "
+                f"workspace/outputs, and cannot be made legal without guessing. "
+                f"Task: {task['task'][:120]}",
+            )
+            continue
+
+        if normalised != original:
+            log_rejection(
+                "ticket_writer",
+                f"PATH NORMALISED {original!r} -> {normalised!r} — a bare filename "
+                f"is not a workspace path. The prompt says so and the model emitted "
+                f"one anyway, which is why this is enforced in code.",
+            )
+
+        legal.append({**task, "file": normalised})
+
+    return legal
 
 
 def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +130,22 @@ def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
         # clue why the sprint was spinning.
         error = "JSON PARSE ERROR: TicketWriter did not output valid JSON."
         log_rejection("ticket_writer", f"{error}\nRaw response:\n{response.content[:600]}")
+        return {
+            "editor_error": error,
+            "editor_retries": 1,
+        }
+
+    tasks = _legalise_paths(tasks)
+
+    if not tasks:
+        # Every ticket named a file the hive is not allowed to write. Fail here,
+        # loudly, rather than handing the graph a queue it will spend the whole
+        # retry budget failing to write — which is precisely what used to happen.
+        error = (
+            "PATH ERROR: every ticket named a file outside workspace/src and "
+            "workspace/outputs. Nothing in this plan is writable."
+        )
+        log_rejection("ticket_writer", error)
         return {
             "editor_error": error,
             "editor_retries": 1,

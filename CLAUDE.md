@@ -4,8 +4,10 @@ A LangGraph state machine that drives local Ollama models through
 plan → ticket → route → write → verify → review → escalate → retrospect.
 
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing the graph or
-the node contracts. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, hooks, and
-releases.
+the node contracts, and [docs/LOOP_ENGINEERING.md](docs/LOOP_ENGINEERING.md)
+before changing anything that runs unattended — it is the layer above the graph,
+and it is where the money is. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup,
+hooks, and releases.
 
 ## Commands
 
@@ -13,6 +15,9 @@ releases.
 pytest                                  # fast; run it constantly
 ruff check --fix src tests scripts
 multi-hive                              # or: python -m multi_hive
+
+multi-hive --loop                       # unattended: the hive finds its own work
+multi-hive --digest                     # what the loop did while you were asleep
 
 python scripts/bench.py sprint            # end-to-end; track this during development
 python scripts/bench.py sprint --contract # ...with human-written acceptance contracts
@@ -40,6 +45,53 @@ Everything else asks it for one by `(purpose, tier)`. Do not `import ChatOllama`
 or `ChatAnthropic` anywhere else — `tests/test_llm_factory.py` scans for it and
 fails the build, because a node that builds its own client silently ignores
 `HIVE_PROVIDER` and nothing would notice until someone switched.
+
+## The loop (`--loop`)
+
+`supervisor.py` → `discovery.py` → `core/journal.py` → `core/governor.py`. Read
+[docs/LOOP_ENGINEERING.md](docs/LOOP_ENGINEERING.md) before touching any of them.
+
+**The governor.** `core/governor.py` meters every model call and raises
+`BudgetExhausted` at a ceiling (`HIVE_MAX_USD`, `HIVE_MAX_TOKENS`,
+`HIVE_MAX_WALL_SEC`, `HIVE_MAX_SPRINTS`). The USD cap defaults to **$5 on
+`anthropic`** and to unlimited on Ollama. Three things are load-bearing:
+
+- **The check runs before the call, not after.** `on_llm_start` raises;
+  `on_llm_end` records. Move it to the end and the governor becomes an audit log
+  that faithfully records every dollar it failed to prevent.
+- **`raise_error = True` on the callback handler.** LangChain swallows exceptions
+  raised inside a callback unless the handler opts in. Drop that line and every
+  test still passes while the governor does nothing at all in production.
+- **`BudgetExhausted` is a `BaseException`.** Every node wraps its model call in
+  `except Exception` and turns what it catches into an `editor_error` — which the
+  graph *retries*. As an ordinary Exception, a budget stop would be caught,
+  retried, refused, caught again, and finally escalated to the human gate blaming
+  a model failure that never happened. It is a stop signal, not an error.
+
+An unpriced model is charged at the priciest rate in the table, on purpose. A
+budget guard that fails open is not a budget guard.
+
+**Discovery.** Escalated-and-unresolved sprints become the next run's queue. A
+discovered item is replayed **byte for byte** (the ACCEPTANCE contract must survive
+the round trip or it stops being ground truth) with one change: `tier_floor=STRONG`.
+That is not a detail. `agent_router_node` seeds every fresh task with
+`select_tier(editor_retries=0)` → *fast*, so without the floor a rediscovered
+objective runs on the model that already failed it and reproduces the identical
+failure — the loop re-doing known-broken work at machine speed and calling it
+progress. `HIVE_FORCE_TIER` still outranks the floor.
+
+**Why the loop terminates.** Three independent bounds. The governor; the attempt
+cap (`HIVE_MAX_DISCOVERY_ATTEMPTS`, default 2); and a progress check. The third is
+the one that bites: a *crashing* sprint writes no journal record, so the attempt
+counter never advances, so discovery hands back the same item forever — free,
+silent, infinite, and invisible to the governor because it spends nothing. The
+supervisor journals crashes itself, and keeps its own in-process memory of what it
+ran so termination does not depend on a disk write landing. `tests/test_supervisor.py`
+pins all three. **Do not weaken them.**
+
+**The attempt cap is the open door for human review.** Work that beats the ladder
+is parked, not retried, and the digest says so loudly — a loop that silently stops
+trying looks exactly like a loop with nothing to do.
 
 ## Things that will bite you
 

@@ -69,27 +69,47 @@ def select_tier(
     complexity: str,
     editor_retries: int = 0,
     repeat_error: bool = False,
+    tier_floor: str | None = None,
 ) -> str:
     """
     The routing decision.
 
     Escalates to the strong model when any of these hold:
 
-    1. FORCE_TIER is set — the operator's override wins over everything.
-    2. The task is classified "hard" — start strong rather than pay a failed
+    1. FORCE_TIER is set — the operator's override wins over everything,
+       including the floor. It exists so a benchmark can pin a tier, and a
+       benchmark that is silently un-pinned by a routing rule is not a benchmark.
+    2. tier_floor is STRONG — a previous *sprint* already failed this task on the
+       fast model. See below.
+    3. The task is classified "hard" — start strong rather than pay a failed
        fast attempt plus a reload to arrive there anyway.
-    3. editor_retries >= ESCALATE_AFTER_FAILURES — the fast model has now
+    4. editor_retries >= ESCALATE_AFTER_FAILURES — the fast model has now
        demonstrably failed this task. Another attempt from it is the same bet.
-    4. repeat_error — the same error fingerprint twice means the model is
+    5. repeat_error — the same error fingerprint twice means the model is
        fixing symptoms. A different model is the only thing that changes the
        outcome; more attempts from this one will not.
 
     Note the ordering relative to the human gate: repeat_error also drives
     escalation to a human. Trying the strong model first is the cheaper move,
     and only if *it* also cycles does the sprint bother the operator.
+
+    On the floor
+    ------------
+    Rules 4 and 5 escalate within a sprint, from evidence gathered in that sprint.
+    The floor is the same idea carried ACROSS sprints, and it is what makes
+    discovery's replay a real retry rather than a re-run: `editor_retries` is 0 at
+    the start of every sprint, so a rediscovered objective would otherwise be
+    routed straight back to the model that already failed it, reproduce the
+    identical failure, and be counted as work. The evidence that the fast model
+    cannot do this task did not stop being true when the process exited.
+
+    Set only by the entrypoint, from discovery. Never by a node.
     """
     if FORCE_TIER in (FAST, STRONG):
         return FORCE_TIER
+
+    if tier_floor == STRONG:
+        return STRONG
 
     if complexity == "hard":
         return STRONG
