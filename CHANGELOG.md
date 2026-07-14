@@ -11,6 +11,8 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+## [4.8.0] - 2026-07-14
+
 ### Added
 
 - **A one-shot baseline arm — the missing half of the cost comparison.** The
