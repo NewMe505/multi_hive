@@ -98,6 +98,29 @@ def test_run_oneshot_records_spend_even_when_the_code_fails(monkeypatch):
     assert result["usd"] > 0
 
 
+def test_run_oneshot_extracts_code_from_fable_style_block_list():
+    """
+    fable-5 has thinking always on, so `.content` is a LIST of blocks (a thinking
+    block plus the text block), not a string. The arm must flatten it — otherwise
+    the fenced code is buried in a repr and every fable one-shot scores zero for a
+    reason that is not the model's fault.
+    """
+    governor.reset()
+
+    class _BlockListLLM:
+        async def ainvoke(self, _messages):
+            content = [
+                {"type": "thinking", "thinking": "", "signature": "abc"},
+                {"type": "text", "text": _BRACKETS_OK},
+            ]
+            return type("R", (), {"content": content})()
+
+    with patch("multi_hive.core.llm_factory.get_async_llm", lambda *a, **k: _BlockListLLM()):
+        result = asyncio.run(runner.run_oneshot("strong", _task("brackets")))
+
+    assert result["passed"] is True, result["failure"]
+
+
 def test_run_oneshot_survives_a_model_error_as_a_failed_task():
     """A transport/model error is scored as a failure, not raised — like run_model."""
     governor.reset()

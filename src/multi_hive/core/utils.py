@@ -31,6 +31,32 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 )
 
 
+def flatten_message_text(content: object) -> str:
+    """
+    Flatten an LLM message's content to plain text.
+
+    Ollama and haiku-4-5 (thinking off, since the hive never enables it) return
+    `.content` as a plain string. fable-5 has thinking ALWAYS on, so
+    langchain_anthropic returns a LIST of content blocks — a `thinking` block
+    (empty text by default) followed by the `text` block. `re.findall` raises
+    TypeError on a list, and `str(list)` renders a repr with escaped newlines that
+    breaks fence-matching — so every fable-5 response would fail code extraction
+    even after the temperature fix, in both the pipeline editor and the one-shot
+    bench arm. Join the text blocks; drop thinking and any other block type.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(parts)
+    return str(content)
+
+
 def safe_path(p: PathLike) -> Path:
     """
     Resolves `p` inside the workspace and validates it against ALLOWED_DIRS.

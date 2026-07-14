@@ -148,6 +148,52 @@ def test_an_async_client_is_never_reused_across_event_loops(monkeypatch):
     llm_factory.invalidate_llm("editor")
 
 
+def test_sampling_params_are_stripped_only_for_models_that_reject_them():
+    """
+    fable-5 (the strong tier) and the rest of the Claude 5 / Opus 4.7+ family return
+    a 400 on temperature/top_p/top_k — they were removed from those models. haiku-4-5
+    (the fast tier) is a 4.5 model and still accepts them. This is what let the fast
+    tier run clean while every escalation to fable-5 died with `temperature is
+    deprecated for this model`, scoring capability failures that were really config.
+    """
+    assert llm_factory._rejects_sampling_params("claude-fable-5")
+    assert llm_factory._rejects_sampling_params("claude-sonnet-5")
+    assert llm_factory._rejects_sampling_params("claude-opus-4-8")
+
+    # The fast tier must keep its temperature — it accepts it, and the measured
+    # numbers were taken with it set.
+    assert not llm_factory._rejects_sampling_params("claude-haiku-4-5-20251001")
+    assert not llm_factory._rejects_sampling_params("qwen2.5-coder:7b")
+
+
+def test_build_drops_temperature_for_fable_but_not_for_haiku(monkeypatch):
+    """The strip happens where the client is actually built, so pin it there."""
+    captured: dict[str, dict] = {}
+
+    class FakeChatAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("langchain_anthropic")
+    fake_mod.ChatAnthropic = FakeChatAnthropic
+
+    monkeypatch.setattr(llm_factory, "PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-real")
+    monkeypatch.setitem(sys.modules, "langchain_anthropic", fake_mod)
+    # The editor kwargs table carries temperature=0.1; MODELS[tier] supplies the model.
+    monkeypatch.setattr(llm_factory, "MODELS", {"fast": "claude-haiku-4-5-20251001", "strong": "claude-fable-5"})
+
+    llm_factory._build("editor", "strong")
+    assert "temperature" not in captured, "fable-5 rejects temperature — it must be stripped"
+
+    captured.clear()
+    llm_factory._build("editor", "fast")
+    assert captured.get("temperature") == 0.1, "haiku accepts temperature — it must survive"
+
+
 def test_anthropic_without_a_key_says_so_instead_of_failing_obscurely(monkeypatch):
     monkeypatch.setattr(llm_factory, "PROVIDER", "anthropic")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

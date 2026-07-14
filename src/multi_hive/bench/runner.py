@@ -329,6 +329,7 @@ async def run_oneshot(tier: str, task: Task) -> dict[str, Any]:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     from multi_hive.core.llm_factory import get_async_llm
+    from multi_hive.core.utils import flatten_message_text
 
     targets = ", ".join(f"outputs/{name}" for name in task.files)
 
@@ -353,7 +354,9 @@ async def run_oneshot(tier: str, task: Task) -> dict[str, Any]:
         response = await llm.ainvoke(
             [SystemMessage(content=system), HumanMessage(content=prompt)]
         )
-        raw = response.content if isinstance(response.content, str) else str(response.content)
+        # fable-5 returns a LIST of content blocks (thinking always on); flatten to
+        # the text blocks before extracting, or the fenced code is unreachable.
+        raw = flatten_message_text(response.content)
         result = grade(_extract_files(raw, task), task)
         failure = result.failure
         passed = result.passed

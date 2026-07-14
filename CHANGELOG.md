@@ -39,6 +39,34 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Fixed
 
+- **The strong tier was completely non-functional on the anthropic provider —
+  two bugs, found by actually running it.** The first paid run surfaced both;
+  neither was visible in any test because the strong tier had never made a real
+  API call.
+
+  1. **fable-5 rejects `temperature` with a 400.** `_ANTHROPIC_KWARGS` sent
+     `temperature=0.1` for every purpose, but the Claude 5 family and Opus 4.7+
+     removed sampling parameters — `temperature is deprecated for this model`. So
+     every task that escalated haiku → fable died on the request, scoring a
+     capability failure (`flatten` 0/3, `word_wrap`/`roman` flaky) that was really
+     a config error. haiku-4-5 (the fast tier) is a 4.5 model and still accepts
+     `temperature`, which is why only escalations failed. `llm_factory` now strips
+     the sampling params for the models that reject them and leaves the fast tier —
+     and all the measured Ollama tuning — untouched.
+
+  2. **fable-5's response is a block list, not a string.** fable-5 has thinking
+     always on, so langchain returns `.content` as a LIST (a thinking block plus
+     the text block). `_extract_clean_code` runs `re.findall` on it — a TypeError
+     on a list — and the one-shot arm's `str(content)` buries the fenced code in a
+     repr. Either way the code was unreachable, so fable would have failed
+     extraction even once the 400 was fixed. `core.utils.flatten_message_text`
+     joins the text blocks; both the pipeline editor and the one-shot bench arm
+     flatten before extracting.
+
+  The pipeline arm's headline `6/9` from the first paid run is therefore an
+  undercount: three of the "failures" were the strong tier never running. Re-run
+  after this fix for the real number.
+
 Three findings from a five-agent adversarial audit (2026-07-14), each a way the
 system spends real money on the anthropic provider without the guard that is
 supposed to stop it.

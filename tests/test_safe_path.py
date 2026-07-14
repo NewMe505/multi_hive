@@ -5,7 +5,29 @@ These tests are the reason it exists.
 import pytest
 
 from multi_hive.config import OUTPUTS_DIR, SRC_DIR, WORKSPACE_DIR
-from multi_hive.core.utils import flush_file, normalise_model_path, safe_path
+from multi_hive.core.utils import (
+    flatten_message_text,
+    flush_file,
+    normalise_model_path,
+    safe_path,
+)
+
+
+def test_flatten_message_text_handles_strings_and_block_lists():
+    # Ollama / haiku: already a plain string, unchanged.
+    assert flatten_message_text("just text") == "just text"
+
+    # fable-5: a list of blocks. Keep text blocks, drop thinking, join with newlines.
+    blocks = [
+        {"type": "thinking", "thinking": "reasoning", "signature": "sig"},
+        {"type": "text", "text": "line one"},
+        {"type": "text", "text": "line two"},
+    ]
+    assert flatten_message_text(blocks) == "line one\nline two"
+
+    # A bare list of strings, and an empty list, both survive.
+    assert flatten_message_text(["a", "b"]) == "a\nb"
+    assert flatten_message_text([]) == ""
 
 
 def test_relative_paths_resolve_into_the_workspace():

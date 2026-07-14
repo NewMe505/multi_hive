@@ -125,6 +125,26 @@ _PURPOSE_KWARGS: dict[str, dict[str, dict]] = {
 
 DEFAULT_TIER = "fast"
 
+# Sampling parameters are REJECTED with a 400 by the Claude 5 family and Opus 4.7+:
+# `temperature`, `top_p`, and `top_k` were removed from those models, which are
+# steered with prompting and `output_config.effort` instead. haiku-4-5 (the fast
+# tier) is a 4.5 model and still accepts them — which is why the fast tier ran fine
+# and only fable-5 escalations died with `temperature is deprecated for this model`.
+# So this is model-specific: strip for the models that refuse the params, and leave
+# the fast tier — and all of the measured local Ollama tuning — untouched.
+_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+_REJECTS_SAMPLING_PREFIXES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+)
+
+
+def _rejects_sampling_params(model: str) -> bool:
+    return any(model.startswith(prefix) for prefix in _REJECTS_SAMPLING_PREFIXES)
+
 
 def _resolve(purpose: str, tier: str) -> dict:
     table = _PURPOSE_KWARGS[PROVIDER]
@@ -169,6 +189,13 @@ def _build(purpose: str, tier: str) -> Any:
                 "HIVE_PROVIDER=anthropic needs langchain-anthropic. "
                 'Install it with:  pip install -e ".[anthropic]"'
             ) from e
+
+        # The strong tier (fable-5) rejects temperature with a 400; the fast tier
+        # (haiku-4-5) accepts it. Drop the sampling params only for the models that
+        # refuse them — see _rejects_sampling_params.
+        if _rejects_sampling_params(kwargs["model"]):
+            for key in _SAMPLING_PARAMS:
+                kwargs.pop(key, None)
 
         return ChatAnthropic(**kwargs)
 

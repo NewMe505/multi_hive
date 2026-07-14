@@ -26,6 +26,7 @@ from multi_hive.core.ast_utils import get_code_outline
 from multi_hive.core.llm_factory import get_async_llm, invalidate_llm, model_for
 from multi_hive.core.memory import get_recent_rejections, log_rejection
 from multi_hive.core.model_router import STRONG, classify_complexity, select_tier
+from multi_hive.core.utils import flatten_message_text
 from multi_hive.state import default_loop_health
 
 _MAX_OBJECTIVE_CHARS = 2000
@@ -320,7 +321,7 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         response = await llm.ainvoke(
             [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
         )
-        extracted = _extract_clean_code(response.content)
+        extracted = _extract_clean_code(flatten_message_text(response.content))
 
         if not extracted:
             # An empty extraction is a generation failure, not a success. Taking
