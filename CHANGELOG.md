@@ -11,6 +11,8 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+## [4.7.0] - 2026-07-14
+
 ### Added
 
 - **The hive runs itself.** `multi-hive --loop` discovers its own work, does it,
