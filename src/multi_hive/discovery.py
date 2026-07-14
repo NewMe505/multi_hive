@@ -136,18 +136,67 @@ def discover(sprints: list[dict] | None = None) -> list[WorkItem]:
     return items
 
 
+def _broken(sprints: list[dict]) -> dict[str, dict]:
+    """
+    Work that FAILED without ever reaching the retry ladder, and never passed.
+
+    A sprint is journalled FAILED when it never got a fair attempt at all: the
+    ticket writer emitted nothing writable ("PATH ERROR: every ticket named a file
+    outside workspace"), the graph crashed, the budget ran out mid-flight.
+
+    These used to vanish completely. `_unfinished` only looks at ESCALATED, and both
+    `discover()` and `parked()` are built on it — so a work item whose only record
+    was FAILED appeared in NEITHER. It was never retried, never handed back, and
+    never mentioned. It simply stopped existing, which is the one outcome an
+    autonomous loop is never allowed to produce.
+
+    They are surfaced but NOT auto-retried, and that asymmetry is deliberate. A
+    FAILED sprint did not lose an argument with the reviewers; something underneath
+    it broke. Retrying that automatically is how you build a loop that spends its
+    night rediscovering that Ollama is down. A human looks, fixes the cause, and
+    re-runs it — and the digest is what tells them to.
+
+    Items that ALSO have an ESCALATED record are excluded: those are ordinary
+    backlog and `_unfinished` already owns them.
+    """
+    escalated = {s.get("key") for s in sprints if s.get("status") == journal.ESCALATED}
+
+    broken: dict[str, dict] = {}
+    for sprint in sprints:
+        key = sprint.get("key")
+        if not key or sprint.get("status") != journal.FAILED:
+            continue
+        if key in escalated or journal.is_resolved(key, sprints):
+            continue
+        broken[key] = sprint  # later sprints overwrite earlier ones
+
+    return broken
+
+
 def parked(sprints: list[dict] | None = None) -> list[WorkItem]:
     """
     Work the loop has given up on and is handing back to a human.
 
     This is the open door. `MAX_DISCOVERY_ATTEMPTS` closes discovery's hands, and
-    this is what makes the result *visible* rather than merely dropped — a loop
-    that silently stops trying looks exactly like a loop with nothing to do, and
-    the difference matters enormously to the person reading the digest.
+    this is what makes the result *visible* rather than merely dropped — a loop that
+    silently stops trying looks exactly like a loop with nothing to do, and the
+    difference matters enormously to the person reading the digest.
+
+    Two kinds of work end up here, and they are not the same kind of stuck:
+
+    - **Beat the ladder.** Escalated, retried on the tier that had not failed it,
+      escalated again. The models are out of rungs; a human has to look at the code.
+    - **Never reached the ladder.** FAILED before the retry loop could even engage —
+      a broken ticket, a crash, a spent budget. Nothing was learned about the task at
+      all, and something underneath it needs fixing first.
+
+    Reporting the second kind as the first ("the ladder is out of rungs") would be a
+    lie, and it is the lie a human reads at 9am.
     """
     records = journal.read_sprints() if sprints is None else sprints
 
     items: list[WorkItem] = []
+
     for key, sprint in _unfinished(records).items():
         attempts = journal.attempts_for(key, records)
         if attempts < MAX_DISCOVERY_ATTEMPTS:
@@ -163,6 +212,22 @@ def parked(sprints: list[dict] | None = None) -> list[WorkItem]:
                 reason=(
                     f"escalated {attempts}x — the ladder is out of rungs"
                     f"{stuck_on}. Needs a human."
+                ),
+            )
+        )
+
+    for key, sprint in _broken(records).items():
+        failure = (sprint.get("failure") or "").strip()
+        because = f" — {failure[:70]}" if failure else ""
+        items.append(
+            WorkItem(
+                objective=sprint["objective"],
+                key=key,
+                attempt=journal.attempts_for(key, records),
+                tier_floor=None,  # nothing was learned about the task; do not presume
+                reason=(
+                    f"failed before the retry ladder even engaged{because}. "
+                    f"Not a model problem — something underneath it broke. Needs a human."
                 ),
             )
         )

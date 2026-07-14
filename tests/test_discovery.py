@@ -202,3 +202,60 @@ def test_parked_work_that_later_passes_stops_being_parked(monkeypatch):
 
     journal.record_sprint("wrap it", journal.CLEAN)  # a human fixed it
     assert discovery.parked() == []
+
+
+# ── Work that FAILED before the ladder engaged ───────────────────────────────
+
+
+def test_a_sprint_that_failed_before_the_ladder_is_not_lost(monkeypatch):
+    """
+    _unfinished only looks at ESCALATED, and BOTH discover() and parked() were built
+    on it. So a work item whose only record was FAILED — the ticket writer emitted
+    nothing writable, the graph crashed, the budget ran out — appeared in NEITHER.
+
+    Never retried. Never handed back. Never mentioned. It simply stopped existing,
+    which is the one outcome an autonomous loop is never allowed to produce.
+    """
+    journal.record_sprint(
+        "wrap it",
+        journal.FAILED,
+        failure="PATH ERROR: every ticket named a file outside workspace",
+    )
+
+    # Not auto-retried: a FAILED sprint did not lose an argument with the reviewers,
+    # something underneath it broke. Retrying that automatically is how you build a
+    # loop that spends its night rediscovering that Ollama is down.
+    assert discovery.discover() == []
+
+    stuck = discovery.parked()
+    assert len(stuck) == 1
+    assert "before the retry ladder even engaged" in stuck[0].reason
+    assert "PATH ERROR" in stuck[0].reason  # and it says WHY
+    assert stuck[0].tier_floor is None  # nothing was learned; do not presume a tier
+
+
+def test_the_two_kinds_of_stuck_are_not_reported_as_the_same_thing(monkeypatch):
+    """
+    Reporting "failed before the ladder engaged" as "the ladder is out of rungs"
+    would be a lie — and it is the lie a human reads at 9am.
+    """
+    monkeypatch.setattr(discovery, "MAX_DISCOVERY_ATTEMPTS", 2)
+
+    journal.record_sprint("beat the ladder", journal.ESCALATED)
+    journal.record_sprint("beat the ladder", journal.ESCALATED)
+    journal.record_sprint("never reached it", journal.FAILED, failure="boom")
+
+    reasons = {i.objective: i.reason for i in discovery.parked()}
+    assert "out of rungs" in reasons["beat the ladder"]
+    assert "before the retry ladder even engaged" in reasons["never reached it"]
+
+
+def test_a_failed_item_that_also_escalated_is_ordinary_backlog(monkeypatch):
+    """An item with an ESCALATED record is already owned by _unfinished; no double."""
+    monkeypatch.setattr(discovery, "MAX_DISCOVERY_ATTEMPTS", 5)
+
+    journal.record_sprint("wrap it", journal.ESCALATED)
+    journal.record_sprint("wrap it", journal.FAILED, failure="ollama was down")
+
+    assert len(discovery.discover()) == 1  # still retryable — the crash cost it nothing
+    assert discovery.parked() == []

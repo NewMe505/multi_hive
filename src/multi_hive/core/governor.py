@@ -11,17 +11,36 @@ ladder is what makes that sharp: the ladder climbs to the expensive tier
 *precisely when a task is failing* — the situation where the loop spends the most
 and produces the least.
 
-Two properties are load-bearing:
+Three properties are load-bearing, and they all say the same thing: **a budget
+guard that fails open is not a budget guard.**
 
 **The check happens before the call, not after.** `on_llm_start` raises;
 `on_llm_end` records. A ceiling that is only enforced once the tokens are already
 spent is an audit log wearing a cap's clothing. This ordering means the governor
 can overshoot by at most one call, never by an unbounded number.
 
-**An unpriced model is priced at the most expensive rate we know.** A budget guard
-that fails open is not a budget guard. If a new model name shows up and we cannot
-price it, we assume the worst and let the cap trip early — a false stop is an
-annoyance, a false pass is a bill.
+**An unpriced model is priced at the most expensive rate we know.** If a new model
+name shows up and we cannot price it, we assume the worst and let the cap trip
+early — a false stop is an annoyance, a false pass is a bill.
+
+**A meter that cannot read a response stops the run rather than guessing zero.**
+This was the hole, and it was a real one. `_tokens_from` could not parse every
+response shape, and when it could not it returned `(0, 0)` — which `record()` added
+as zero tokens and $0.00, indistinguishable from a genuinely free call. So one
+change to a provider's usage field would make the meter read zero *forever*:
+`HIVE_MAX_USD` could never trip, and an overnight loop would bill the entire night
+while reporting that it had spent nothing. The old docstring even excused it —
+"the wall-clock ceiling still bounds the run either way" — and `HIVE_MAX_WALL_SEC`
+defaults to **0, i.e. off**. The named backstop did not exist.
+
+Now an unreadable response is counted as *unreadable*, not as free, and once
+`HIVE_MAX_UNMETERED` of them pile up the run stops — but only when a ceiling
+actually DEPENDS on the meter (`HIVE_MAX_USD` / `HIVE_MAX_TOKENS`). Stopping then
+is not "the budget is spent". It is "I can no longer tell", and continuing to spend
+money you cannot count is precisely the failure this module exists to prevent.
+
+A free local run sets no spend ceiling, so it is never stopped over bookkeeping it
+does not need. See `Governor.meter_is_load_bearing`.
 
 The meter hangs off `core/llm_factory.py`, which is the only module in the system
 permitted to construct a client (`tests/test_llm_factory.py` enforces this). That
@@ -40,6 +59,7 @@ from typing import Any
 from multi_hive.config import (
     MAX_SPRINTS,
     MAX_TOKENS,
+    MAX_UNMETERED,
     MAX_USD,
     MAX_WALL_SEC,
     PROVIDER,
@@ -94,7 +114,16 @@ _PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
 
 # The fail-safe rate for a model we cannot price. See the module docstring: a
 # budget guard that fails open is not a budget guard.
-_UNKNOWN_MODEL_RATE = max(_PRICING_USD_PER_MTOK.values(), key=lambda r: r[1])
+#
+# The maximum on BOTH axes independently — not the entry with the highest output
+# price. Those happen to be the same row today, so the old `max(..., key=r[1])` was
+# correct by luck. Add one model priced (20.00, 2.00) and an unknown model would
+# have been billed at (10, 50), under-counting its input by 2x, inside the one
+# function whose entire declared job is to fail closed.
+_UNKNOWN_MODEL_RATE = (
+    max(r[0] for r in _PRICING_USD_PER_MTOK.values()),
+    max(r[1] for r in _PRICING_USD_PER_MTOK.values()),
+)
 
 
 def price(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -120,6 +149,14 @@ class Spend:
     usd: float = 0.0
     calls: int = 0
     sprints: int = 0
+    # Calls that RETURNED CONTENT but reported no usage. See Governor.breach.
+    #
+    # This is the fail-open hole. _tokens_from() returns (0, 0) for any response
+    # shape it does not recognise, and record() then adds 0 tokens and $0.00 — so a
+    # single change in a provider's usage field makes the meter read zero forever,
+    # HIVE_MAX_USD never trips, and an overnight loop bills the whole night. A budget
+    # guard that fails open is not a budget guard; this counter is what closes it.
+    unmetered: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -137,6 +174,7 @@ class Spend:
             "total_tokens": self.total_tokens,
             "usd": round(self.usd, 6),
             "calls": self.calls,
+            "unmetered": self.unmetered,
             "sprints": self.sprints,
             "wall_sec": round(self.wall_sec, 1),
         }
@@ -158,15 +196,33 @@ class Governor:
         max_tokens: int = MAX_TOKENS,
         max_wall_sec: float = MAX_WALL_SEC,
         max_sprints: int = MAX_SPRINTS,
+        max_unmetered: int = MAX_UNMETERED,
     ) -> None:
         self.max_usd = max_usd
         self.max_tokens = max_tokens
         self.max_wall_sec = max_wall_sec
         self.max_sprints = max_sprints
+        self.max_unmetered = max_unmetered
         self.spend = Spend()
         self._lock = threading.Lock()
 
     # ── Enforcement ───────────────────────────────────────────────────────────
+
+    @property
+    def meter_is_load_bearing(self) -> bool:
+        """
+        True when a ceiling can only be enforced if the meter actually works.
+
+        HIVE_MAX_USD and HIVE_MAX_TOKENS are computed FROM the meter. If the meter
+        silently reads zero, neither of them can ever trip.
+
+        HIVE_MAX_WALL_SEC and HIVE_MAX_SPRINTS are not — they are counted by the
+        clock and by the supervisor, and they hold no matter what the model reports.
+        So when only those are set, an unmeterable response costs us bookkeeping
+        accuracy and nothing else, and stopping the run over it would be a worse
+        trade than continuing.
+        """
+        return bool(self.max_usd or self.max_tokens)
 
     def breach(self) -> str | None:
         """The ceiling that has been reached, as a human sentence, or None."""
@@ -187,6 +243,37 @@ class Governor:
         if self.max_sprints and s.sprints >= self.max_sprints:
             return f"{s.sprints} sprints reached the {self.max_sprints} ceiling (HIVE_MAX_SPRINTS)"
 
+        # ── The meter itself has failed ───────────────────────────────────────
+        #
+        # This is the fail-open hole, closed.
+        #
+        # _tokens_from() cannot read every possible response shape, and when it
+        # cannot it returns (0, 0) — so record() adds zero tokens and $0.00, the
+        # spend total never grows, HIVE_MAX_USD never trips, and an overnight loop
+        # bills the entire night while reporting that it spent nothing. One change
+        # to a provider's usage field is all it takes. The module docstring above
+        # says "a budget guard that fails open is not a budget guard", and until now
+        # that is exactly what this was.
+        #
+        # So: if a ceiling DEPENDS on the meter and the meter has failed this many
+        # times, stop. Not because the budget is spent, but because we can no longer
+        # tell — and continuing to spend money you cannot count is the failure the
+        # governor exists to prevent.
+        #
+        # Guarded by meter_is_load_bearing so a free local run, which sets no
+        # spend ceiling, is never stopped over bookkeeping it does not need.
+        if (
+            self.meter_is_load_bearing
+            and self.max_unmetered
+            and s.unmetered >= self.max_unmetered
+        ):
+            return (
+                f"{s.unmetered} model calls returned content but reported no token "
+                f"usage — the meter is broken, so HIVE_MAX_USD/HIVE_MAX_TOKENS cannot "
+                f"be enforced. Refusing to keep spending money that cannot be counted "
+                f"(HIVE_MAX_UNMETERED)"
+            )
+
         return None
 
     def check(self) -> None:
@@ -202,6 +289,12 @@ class Governor:
             self.spend.input_tokens += input_tokens
             self.spend.output_tokens += output_tokens
             self.spend.usd += price(model, input_tokens, output_tokens)
+            self.spend.calls += 1
+
+    def record_unmetered(self) -> None:
+        """A call that returned content and reported no usage. See breach()."""
+        with self._lock:
+            self.spend.unmetered += 1
             self.spend.calls += 1
 
     def record_sprint(self) -> None:
@@ -277,28 +370,41 @@ def spend_since(before: Spend) -> dict[str, Any]:
 # ── The meter ─────────────────────────────────────────────────────────────────
 
 
-def _tokens_from(response: Any) -> tuple[int, int]:
+def _tokens_from(response: Any) -> tuple[int, int] | None:
     """
-    Pulls (input, output) token counts out of a LangChain LLMResult.
+    (input, output) token counts from a LangChain LLMResult, or None if the usage
+    could not be read at all.
+
+    **None and (0, 0) are different answers, and conflating them was the bug.**
+
+    This used to return (0, 0) for a response it could not parse. record() then
+    added zero tokens and $0.00 — indistinguishable from a genuinely free call. So
+    a single change in a provider's usage field would make the meter read zero
+    forever: HIVE_MAX_USD would never trip, and an overnight loop would bill the
+    whole night while reporting that it had spent nothing.
+
+    The docstring even excused it — "the wall-clock ceiling still bounds the run
+    either way" — and HIVE_MAX_WALL_SEC defaults to **0, i.e. off**. The named
+    backstop did not exist.
+
+    None now means "I could not meter this", the meter counts it, and the governor
+    stops the run once a ceiling that DEPENDS on the meter can no longer be trusted.
+    See Governor.breach.
 
     Two shapes, because two providers. `usage_metadata` is the modern
-    provider-neutral field, and the Anthropic client populates it. The Ollama
-    client reports `prompt_eval_count` / `eval_count` in response_metadata — the
-    same fields bench/runner.py already reads — and older langchain-ollama does
-    not fill usage_metadata at all, hence the fallback rather than a single path.
+    provider-neutral field, and the Anthropic client populates it. The Ollama client
+    reports `prompt_eval_count` / `eval_count` in response_metadata — the same
+    fields bench/runner.py already reads — and older langchain-ollama does not fill
+    usage_metadata at all, hence the fallback rather than a single path.
 
     (The provider client classes are deliberately not named here: the guard in
-    tests/test_llm_factory.py is a substring scan, which is what makes it
-    impossible to fool, and keeping it that way is worth more than the phrasing.)
-
-    Returns (0, 0) rather than raising if neither is present. An un-metered call
-    is a bug, but crashing a sprint over a bookkeeping miss is a worse one — and
-    the wall-clock ceiling still bounds the run either way.
+    tests/test_llm_factory.py is a substring scan, which is what makes it impossible
+    to fool, and keeping it that way is worth more than the phrasing.)
     """
     try:
         generation = response.generations[0][0]
     except (AttributeError, IndexError):
-        return 0, 0
+        return None
 
     message = getattr(generation, "message", None)
 
@@ -310,7 +416,7 @@ def _tokens_from(response: Any) -> tuple[int, int]:
     if "eval_count" in meta or "prompt_eval_count" in meta:
         return int(meta.get("prompt_eval_count", 0)), int(meta.get("eval_count", 0))
 
-    return 0, 0
+    return None
 
 
 def _handler_base() -> Any:
@@ -335,6 +441,14 @@ def meter(model: str) -> Any:
         # LangChain swallows exceptions raised inside a callback unless the
         # handler opts in. Without this the BudgetExhausted would be logged and
         # the call would proceed — the governor would be decorative.
+        #
+        # THIS HANDLER MUST STAY SYNCHRONOUS. langchain_core's callback manager
+        # documents that an ASYNC handler driven through the SYNC handle_event path
+        # has its exceptions "always logged and swallowed, regardless of the
+        # handler's raise_error setting". Half this system's nodes are sync
+        # (ticket_writer, sprint_planner, reviewer_node), so promoting _Meter to an
+        # AsyncCallbackHandler — an obvious-looking modernisation — would silently
+        # disable the budget check for every one of them, and no test would fail.
         raise_error = True
 
         def __init__(self, model_name: str) -> None:
@@ -351,7 +465,13 @@ def meter(model: str) -> Any:
             current().check()
 
         def on_llm_end(self, response: Any, **kwargs: Any) -> None:
-            input_tokens, output_tokens = _tokens_from(response)
-            current().record(self.model_name, input_tokens, output_tokens)
+            usage = _tokens_from(response)
+            if usage is None:
+                # The call happened and we cannot say what it cost. Counting it as
+                # $0.00 is what let the meter fail open; count it as *unreadable*
+                # instead, and let the governor decide whether that is survivable.
+                current().record_unmetered()
+                return
+            current().record(self.model_name, *usage)
 
     return _Meter(model)
