@@ -31,14 +31,40 @@ from pathlib import Path
 class Task:
     name: str
     complexity: str  # trivial | moderate | hard
-    filename: str  # where the sprint suite expects the artefact
+    filename: str  # the GRADED artefact — the hidden tests import this one
     prompt: str  # what the model is told
     tests: str  # what it is graded on, and never sees
+
+    # Other files the task must also produce, alongside `filename`, in outputs/.
+    #
+    # This is the workload multi_hive actually exists for, and until now the
+    # benchmark contained not one example of it. Every other task in this suite is
+    # a single self-contained function in a single file — which is precisely what a
+    # one-shot call to a strong model is best at, and precisely where planning,
+    # ticketing, cross-file context and iterative retry have no room to add
+    # anything. On that suite the pipeline is 2x slower than one call to the 30B
+    # and two tasks worse, and it could not have been otherwise: there was nothing
+    # to plan and nothing to decompose.
+    #
+    # A task with a second file changes the question. The graded module IMPORTS the
+    # other one, so the two have to agree on an interface that neither file states
+    # on its own. That is a coordination problem, and coordination is the only thing
+    # a pipeline can do that a single prompt cannot.
+    extra_files: tuple[str, ...] = ()
+
+    @property
+    def files(self) -> tuple[str, ...]:
+        """Every file the task must produce. The first one is the graded artefact."""
+        return (self.filename, *self.extra_files)
 
     @property
     def objective(self) -> str:
         """The prompt as a user objective, for the end-to-end sprint suite."""
-        return f"{self.prompt}\nSave it to outputs/{self.filename}"
+        if not self.extra_files:
+            return f"{self.prompt}\nSave it to outputs/{self.filename}"
+
+        listing = "\n".join(f"  outputs/{name}" for name in self.files)
+        return f"{self.prompt}\n\nSave the files to:\n{listing}"
 
 
 @dataclass
@@ -310,6 +336,75 @@ got = M.flatten({"a": {}, "b": 1})
 assert got == {"b": 1}, f"empty nested dict produced a key: {got}"
 """,
     ),
+    # ── The task this project actually exists for ─────────────────────────────
+    #
+    # Every other task in this suite is one self-contained function in one file.
+    # That is exactly what a one-shot call to a strong model is best at, and exactly
+    # where a pipeline has nothing to contribute: nothing to plan, nothing to
+    # decompose, no cross-file context to carry, no reason to iterate. Measured on
+    # the 8-task suite, the full hive is 2x slower than a single call to the 30B and
+    # two tasks worse — and it could not have been otherwise.
+    #
+    # This one has two files, and the graded module IMPORTS the other. Neither file
+    # states the interface on its own; the model has to hold both in its head at
+    # once and make them agree. That is a coordination problem, and coordination is
+    # the only thing a pipeline can do that a single prompt cannot — it is what the
+    # planner, the ticket queue, and core/ast_utils (which feeds one file's
+    # signatures into the next file's prompt) were all built for.
+    #
+    # If the hive cannot beat a one-shot 30B here, that is a finding about the
+    # architecture, and a much more useful one than "it loses at leetcode".
+    Task(
+        name="word_stats",
+        complexity="hard",
+        filename="stats.py",
+        extra_files=("tokens.py",),
+        prompt=(
+            "Implement a two-module word-frequency tool.\n\n"
+            "outputs/tokens.py defines:\n"
+            "  tokenize(text: str) -> list[str]\n"
+            "  Lowercases the text, splits on whitespace, and strips leading and "
+            "trailing punctuation (.,!?;:'\") from each word. Words that become "
+            "empty are dropped.\n\n"
+            "outputs/stats.py defines:\n"
+            "  top_words(text: str, n: int) -> list[tuple[str, int]]\n"
+            "  The n most frequent words as (word, count), most frequent first. "
+            "Ties are broken alphabetically.\n\n"
+            "stats.py MUST import tokenize from tokens.py and use it. "
+            "Do NOT reimplement tokenization inside stats.py."
+        ),
+        # The `sys.modules` check is the whole point: it proves stats.py actually
+        # DELEGATES to tokens.py rather than quietly reimplementing it. A model that
+        # inlines the tokenizer produces two files that both look right and are not
+        # a system — and that is the failure mode a single-file benchmark can never
+        # see.
+        #
+        # The other traps are ordinary: n larger than the vocabulary, and empty
+        # input. Neither is stated in the prompt.
+        tests="""
+import sys
+assert "tokens" in sys.modules, "stats.py did not import tokens.py — it reimplemented it"
+
+T = sys.modules["tokens"]
+assert T.tokenize("Hello, world!") == ["hello", "world"], T.tokenize("Hello, world!")
+assert T.tokenize("  a   b  ") == ["a", "b"]
+assert T.tokenize("...") == [], "punctuation-only word was not dropped"
+
+got = M.top_words("the cat the dog the bird cat", 2)
+assert got == [("the", 3), ("cat", 2)], got
+
+got = M.top_words("b a c", 3)
+assert got == [("a", 1), ("b", 1), ("c", 1)], f"ties not broken alphabetically: {got}"
+
+got = M.top_words("Dog! dog, DOG. cat", 1)
+assert got == [("dog", 3)], f"case/punctuation not normalised through tokenize: {got}"
+
+assert M.top_words("", 3) == []
+
+got = M.top_words("a b", 5)
+assert got == [("a", 1), ("b", 1)], f"n larger than the vocabulary: {got}"
+""",
+    ),
 ]
 
 BY_NAME = {task.name: task for task in TASKS}
@@ -338,31 +433,60 @@ print("PASS {token}")
 """
 
 
-def grade(code: str, task: Task, timeout: int = 60) -> Grade:
+def grade(code: str | dict[str, str], task: Task, timeout: int = 60) -> Grade:
     """
-    Run `task`'s hidden suite against `code`, in a separate process.
+    Run `task`'s hidden suite against the candidate, in a separate process.
 
     Separate process because the code under test is model-authored: it may
     hang, exit(), or blow the stack, and none of that should take the harness
     with it.
+
+    `code` is either a single source string (the common case — one file), or a
+    {filename: source} map for a multi-file task. Every file is written into the
+    temp directory side by side, so the graded module's own
+    `from tokens import tokenize` resolves against its sibling exactly as it does
+    in the workspace: the harness script lives in that directory, so it is
+    sys.path[0].
+
+    A missing sibling is a FAILURE, not a crash. It has to be — "the model wrote
+    one of the two files it was asked for" is precisely the outcome a multi-file
+    task exists to catch, and reporting it as an import error would hide what
+    actually went wrong.
     """
-    result = Grade(extracted=bool(code.strip()))
-    if not result.extracted:
+    files = {task.filename: code} if isinstance(code, str) else dict(code)
+
+    if not (files.get(task.filename) or "").strip():
+        result = Grade()
         result.failure = "no code"
         return result
 
-    with tempfile.TemporaryDirectory() as tmp:
-        module = Path(tmp) / "candidate.py"
-        module.write_text(code, encoding="utf-8")
+    missing = [name for name in task.files if not (files.get(name) or "").strip()]
+    if missing:
+        result = Grade(extracted=True)
+        result.failure = f"missing {', '.join('outputs/' + m for m in missing)}"
+        return result
 
-        compiled = subprocess.run(
-            [sys.executable, "-m", "py_compile", str(module)],
-            capture_output=True,
-            text=True,
-        )
-        if compiled.returncode != 0:
-            result.failure = "syntax error"
-            return result
+    result = Grade(extracted=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Every file, side by side — the graded module imports its siblings by
+        # plain name, which only works because they share a directory.
+        for name, source in files.items():
+            (Path(tmp) / name).write_text(source, encoding="utf-8")
+
+        module = Path(tmp) / task.filename
+
+        for name in task.files:
+            compiled = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(Path(tmp) / name)],
+                capture_output=True,
+                text=True,
+            )
+            if compiled.returncode != 0:
+                result.failure = (
+                    "syntax error" if name == task.filename else f"syntax error in {name}"
+                )
+                return result
         result.compiles = True
 
         body = "\n".join("    " + line for line in task.tests.strip().splitlines())

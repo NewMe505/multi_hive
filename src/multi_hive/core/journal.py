@@ -108,29 +108,83 @@ def record_sprint(
 
 
 def read_sprints() -> list[dict[str, Any]]:
-    """Every sprint ever journalled, oldest first. Malformed lines are skipped."""
+    """
+    Every sprint ever journalled, oldest first. Malformed lines are skipped.
+
+    `errors="replace"` is load-bearing, and leaving it out was a real bug.
+
+    The try/except below guards `json.loads` — but the decoding happens in
+    `for line in f`, OUTSIDE it. A torn write leaves invalid UTF-8, the iterator
+    raises UnicodeDecodeError (a ValueError, not a JSONDecodeError), and nothing
+    catches it. The comment promising "the rest of the file is still good" was false
+    for the exact failure it named.
+
+    And a torn write is reachable. A record stores the objective in full and never
+    truncates it, so records routinely exceed the 8 KiB buffer and land as several
+    write() calls. Two appenders — a cron `--loop` overlapping a REPL, which is the
+    deployment the governor was built for — can split a multi-byte character.
+
+    The blast radius was the entire loop: `discover()` inside supervisor's
+    `while True`, `digest()`, and `--digest` all read this file, and JOURNAL_FILE is
+    never cleared. One torn byte would brick the autonomous loop until a human
+    hand-edited the file.
+    """
     if not JOURNAL_FILE.exists():
         return []
 
     sprints: list[dict[str, Any]] = []
-    with JOURNAL_FILE.open("r", encoding="utf-8") as f:
+    with JOURNAL_FILE.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.strip():
                 continue
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                continue  # a torn write; the rest of the file is still good
-            if record.get("type") == "sprint":
+                continue  # a torn write; the rest of the file really is still good
+            if isinstance(record, dict) and record.get("type") == "sprint":
                 sprints.append(record)
 
     return sprints
 
 
+# A sprint that ran on its own merits. A FAILED record is neither of these: it means
+# the sprint never got a fair attempt.
+_MERIT = (CLEAN, ESCALATED)
+
+
 def attempts_for(key: str, sprints: list[dict[str, Any]] | None = None) -> int:
-    """How many times this work item has been run, to any outcome."""
+    """
+    How many times this work item has actually been TRIED on its merits.
+
+    Deliberately not "to any outcome", which is what this used to count and which
+    silently retired real work.
+
+    `discovery` parks an item once attempts >= MAX_DISCOVERY_ATTEMPTS (default 2).
+    A FAILED record is written when the sprint never got a fair attempt at all:
+    the supervisor journals a crash as FAILED so the counter advances and the loop
+    cannot spin, and a budget-exhausted sprint is FAILED too.
+
+    Counting those as attempts meant:
+
+        human runs objective X            -> ESCALATED   (attempt 1)
+        `--loop` picks it up, Ollama is down -> FAILED    (attempt 2)
+        -> attempts == 2 -> PARKED FOREVER
+
+    Zero tokens were spent. The strong model — the entire point of the
+    `tier_floor=STRONG` replay — never ran. And `parked()` then hands it to a human
+    saying "escalated 2x — the ladder is out of rungs", when the ladder was never
+    climbed. The one artefact a human reads would be asserting something false.
+
+    Same shape, worse: one `HIVE_MAX_USD` misconfiguration during an overnight run
+    could permanently retire every item in the backlog, and raising the cap would
+    not bring them back.
+
+    Termination does not depend on this count. The supervisor keeps its own
+    in-process `attempted` set, which is what actually stops a journal that is not
+    advancing (see supervisor.run).
+    """
     records = read_sprints() if sprints is None else sprints
-    return sum(1 for s in records if s.get("key") == key)
+    return sum(1 for s in records if s.get("key") == key and s.get("status") in _MERIT)
 
 
 def is_resolved(key: str, sprints: list[dict[str, Any]] | None = None) -> bool:

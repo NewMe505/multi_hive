@@ -86,15 +86,23 @@ def test_the_attempt_cap_bounds_the_backlog(monkeypatch):
 
 def test_a_crashing_sprint_cannot_spin_forever(monkeypatch):
     """
-    The bug this module was written around.
+    The bug this module was written around: a crashing sprint hands the SAME work
+    item back on the next pass, forever, in a tight loop that spends no tokens and
+    therefore never trips the governor. Free, silent, and infinite.
 
-    A crashing sprint writes no journal record. No record means attempts_for()
-    never advances. Which means discover() hands back the SAME work item on the
-    next pass — forever, in a tight loop that spends no tokens and therefore never
-    trips the governor. Free, silent, and infinite.
+    What stops it is the in-process `attempted` set — NOT the journal counter.
 
-    The supervisor journals the crash itself, explicitly, so the attempt counter
-    advances no matter what. Without that, this test hangs.
+    That distinction is the whole point of this test, and it was mis-stated at
+    first. The supervisor journals a crash as FAILED, and `attempts_for` used to
+    count that as an attempt, so the counter advanced and the item was eventually
+    parked. But counting a crash as an attempt is its own bug: a single Ollama
+    outage would burn one of the item's two chances having spent zero tokens, and
+    a `HIVE_MAX_USD` misconfiguration could park an entire backlog permanently.
+    `attempts_for` now counts only sprints that ran on their merits.
+
+    Which means the journal counter no longer advances on a crash — and this test
+    still terminates, because `attempted` is what was actually holding the line.
+    Delete it and this test hangs.
     """
     monkeypatch.setattr(discovery, "MAX_DISCOVERY_ATTEMPTS", 2)
     calls = _sprints_run(monkeypatch, crash=True)
@@ -105,7 +113,9 @@ def test_a_crashing_sprint_cannot_spin_forever(monkeypatch):
 
     assert completed == 1
     assert len(calls) == 1  # tried once, crashed, did NOT try again
-    assert journal.attempts_for(journal.key_for("wrap it")) == 2  # the crash was recorded
+
+    # The crash did NOT burn one of the item's attempts — it never got a fair run.
+    assert journal.attempts_for(journal.key_for("wrap it")) == 1
 
 
 def test_a_resolved_item_leaves_the_backlog(monkeypatch):

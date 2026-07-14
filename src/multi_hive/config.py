@@ -216,7 +216,54 @@ MAX_DISCOVERY_ATTEMPTS = int(os.environ.get("HIVE_MAX_DISCOVERY_ATTEMPTS", "2"))
 
 # ── Workspace layout ──────────────────────────────────────────────────────────
 
-WORKSPACE_DIR = Path(os.environ.get("HIVE_WORKSPACE", "workspace")).resolve()
+
+def _validated_workspace(raw: str) -> Path:
+    """
+    Resolve HIVE_WORKSPACE, and refuse a location we must never delete inside.
+
+    The workspace is not merely written to. `bench/runner.clean_workspace()`
+    RECURSIVELY DELETES every `*.py` under it before each benchmark task, because a
+    module left behind by an earlier task can shadow an import and let a task pass
+    on yesterday's code.
+
+    That makes HIVE_WORKSPACE a loaded gun, and it was accepted unvalidated while
+    the README said "Relocate it with HIVE_WORKSPACE=/some/path". The obvious
+    relocation is the obvious disaster:
+
+        HIVE_WORKSPACE=.       python scripts/bench.py sprint
+        -> SRC_DIR == <repo>/src -> every .py in the multi_hive package, deleted
+
+    `HIVE_WORKSPACE=$HOME` takes `~/src/**/*.py` with it. `ensure_workspace()` even
+    mkdir's the target first, so it cheerfully creates the directory it is about to
+    recurse into and destroy.
+
+    So the workspace may not be, or contain, this source tree; may not be the
+    home directory; and may not be a filesystem root. Anything else is the user's
+    business. Raising here rather than in clean_workspace() is deliberate: the
+    check should fire when the process starts, not forty seconds into a benchmark
+    with the delete already half done.
+    """
+    workspace = Path(raw).resolve()
+    repo_root = Path(__file__).resolve().parents[2]
+
+    def refuse(why: str) -> None:
+        raise ValueError(
+            f"HIVE_WORKSPACE={raw!r} resolves to {workspace}, {why}.\n"
+            f"The benchmark recursively deletes *.py inside the workspace, so this "
+            f"would destroy real work. Point it at a directory of its own."
+        )
+
+    if workspace == Path(workspace.anchor):
+        refuse("which is a filesystem root")
+    if workspace == Path.home():
+        refuse("which is your home directory")
+    if workspace == repo_root or repo_root.is_relative_to(workspace):
+        refuse("which contains multi_hive's own source tree")
+
+    return workspace
+
+
+WORKSPACE_DIR = _validated_workspace(os.environ.get("HIVE_WORKSPACE", "workspace"))
 
 SRC_DIR = WORKSPACE_DIR / "src"
 OUTPUTS_DIR = WORKSPACE_DIR / "outputs"
