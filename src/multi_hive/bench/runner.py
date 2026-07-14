@@ -98,6 +98,48 @@ def _extract_code(raw: str) -> str:
     return max(matches, key=len).strip() if matches else ""
 
 
+# "# FILE: outputs/stats.py" — how a one-shot response labels which block is which.
+_FILE_MARK = re.compile(r"#\s*FILE:\s*(?:outputs/)?([\w.\-]+\.py)", re.IGNORECASE)
+
+
+def _extract_files(raw: str, task: Task) -> dict[str, str]:
+    """
+    Pull the task's files out of a single model response.
+
+    Single-file tasks keep the old behaviour exactly: the longest fenced block.
+
+    Multi-file tasks need to know which block is which, so run_model asks the model
+    to label each with `# FILE: outputs/<name>`. An unlabelled block is DROPPED
+    rather than guessed at: assigning a block to the wrong file would score a
+    coherent answer as a failure, and inventing a mapping is the sort of
+    helpfulness that turns a benchmark into a story.
+
+    A one-shot model that genuinely cannot produce two coherent files therefore
+    scores a real failure ("missing outputs/tokens.py"), not a harness artefact.
+    That has to hold for the multi-file comparison to mean anything at all — the
+    entire question is whether the pipeline beats one prompt, and the answer is
+    worthless if the prompt was handicapped by the grader.
+    """
+    fence = chr(96) * 3
+    blocks = re.findall(fence + r"python\n(.*?)\n" + fence, raw, re.DOTALL)
+    if not blocks:
+        return {}
+
+    if len(task.files) == 1:
+        return {task.filename: max(blocks, key=len).strip()}
+
+    found: dict[str, str] = {}
+    for block in blocks:
+        mark = _FILE_MARK.search(block[:300])
+        if not mark:
+            continue
+        name = mark.group(1)
+        if name in task.files:
+            found[name] = block.strip()
+
+    return found
+
+
 def gpu_placement(model: str) -> str:
     """How Ollama actually split the model between GPU and CPU, once resident."""
     try:
@@ -113,10 +155,24 @@ def gpu_placement(model: str) -> str:
 
 def run_model(model: str, task: Task, num_ctx: int = 4096, num_predict: int = 2048) -> dict[str, Any]:
     """One task, one model, no graph."""
+    targets = ", ".join(f"outputs/{name}" for name in task.files)
+
+    prompt = task.prompt
+    if len(task.files) > 1:
+        # Give the one-shot baseline a fair, explicit way to emit more than one
+        # file. Without it, a model that CAN do the task would still score zero for
+        # want of a format, and the multi-file comparison — which exists precisely
+        # to ask whether the pipeline beats one prompt — would be rigged.
+        prompt += (
+            "\n\nOutput ONE ```python code block per file, and begin each block "
+            "with a comment naming the file, exactly like:\n"
+            "# FILE: outputs/stats.py"
+        )
+
     payload = {
         "model": model,
-        "prompt": task.prompt,
-        "system": get_editor_prompt(f"Write outputs/{task.filename}", ""),
+        "prompt": prompt,
+        "system": get_editor_prompt(f"Write {targets}", ""),
         "stream": True,
         "options": {"temperature": 0.1, "num_ctx": num_ctx, "num_predict": num_predict},
     }
@@ -149,7 +205,7 @@ def run_model(model: str, task: Task, num_ctx: int = 4096, num_predict: int = 20
     tokens = final.get("eval_count", 0)
     eval_ns = final.get("eval_duration", 0)
 
-    result = grade(_extract_code("".join(chunks)), task)
+    result = grade(_extract_files("".join(chunks), task), task)
 
     return {
         "task": task.name,
@@ -192,7 +248,6 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
     # are not independent samples, and the run is not reproducible.
     clean_workspace()
 
-    artefact = OUTPUTS_DIR / task.filename
     target = f"outputs/{task.filename}"
 
     initial = {
@@ -247,8 +302,18 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
 
     wall = time.perf_counter() - started
 
-    code = artefact.read_text(encoding="utf-8") if artefact.exists() else ""
-    result = grade(code, task)
+    # EVERY file the task asked for, not just the graded one. A multi-file task is
+    # not done until all of them are on disk, and reading only the graded artefact
+    # would let a sprint that wrote stats.py and silently skipped tokens.py be
+    # graded as though it had produced a working system. It would not even fail
+    # cleanly — it would fail at import, and be reported as broken code.
+    files = {
+        name: (OUTPUTS_DIR / name).read_text(encoding="utf-8")
+        if (OUTPUTS_DIR / name).exists()
+        else ""
+        for name in task.files
+    }
+    result = grade(files, task)
 
     return {
         "task": task.name,
@@ -259,7 +324,7 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
         "nodes": nodes,
         "tiers": tiers,           # ["fast"] or ["fast", "strong"] — did it escalate?
         "escalated_to_human": escalated,
-        "wrote_artefact": bool(code),
+        "wrote_artefact": bool(files.get(task.filename)),
         # The gaming detector. In contract mode, contract_satisfied=True with
         # passed=False means the code cleared the human's asserts and failed the
         # hidden ones — which is what memorising the contract's literal inputs

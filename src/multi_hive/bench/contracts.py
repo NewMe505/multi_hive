@@ -184,6 +184,31 @@ assert flatten({"k": [3, 4]}) == {"k": [3, 4]}
 
 assert flatten({"m": {"n": 5}}, sep="_") == {"m_n": 5}
 """,
+    # The multi-file task. This contract names only what stats.py exports, because
+    # stats.py is the module the contract harness imports — it cannot reach into
+    # tokens.py, and a contract that tried would be testing the harness instead of
+    # the code.
+    #
+    # That is a real limitation, and worth stating rather than hiding: this contract
+    # can check that the SYSTEM behaves. It cannot check that stats.py actually
+    # delegates to tokens.py instead of quietly reimplementing it. The hidden suite
+    # checks exactly that, with `"tokens" in sys.modules`.
+    #
+    # So on this one task the hidden suite is strictly stronger than the contract —
+    # the only place in the benchmark where that is true, and something to remember
+    # when reading a contract-mode score for it.
+    #
+    # Literals disjoint from the hidden suite, as always: the contract counts x/y/z
+    # and "Fog", the suite counts the/cat/dog and "Dog".
+    "word_stats": """\
+assert top_words("x y x z x y", 2) == [("x", 3), ("y", 2)]
+
+# Ties are broken alphabetically.
+assert top_words("q p r", 3) == [("p", 1), ("q", 1), ("r", 1)]
+
+# Case and punctuation are normalised away before counting.
+assert top_words("Fog! fog, FOG. mist", 1) == [("fog", 3)]
+""",
 }
 
 
