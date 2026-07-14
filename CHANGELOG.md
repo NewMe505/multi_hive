@@ -11,6 +11,32 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Added
+
+- **A one-shot baseline arm — the missing half of the cost comparison.** The
+  `models` suite measured tok/s and GPU placement and so refused to run off
+  Ollama; on a hosted provider it now runs each task as a metered one-shot
+  instead. This is the number the whole "5-8x cheaper" thesis is measured
+  against, and it did not exist: the pipeline's `$/task` was being compared to a
+  baseline nobody had run on the same provider.
+
+  `runner.run_oneshot(tier, task)` prompts the model once through `llm_factory` —
+  same system prompt, same token budget, same governor the sprint uses — and
+  grades the result against the same hidden suite. Because both arms now go
+  through one meter and one tokenizer, `1shot:strong@anthropic` and
+  `hive+contract@anthropic` are finally the same kind of number, and the ratio
+  between them is a subtraction rather than the extrapolation it had been. The two
+  stay on separate history subjects — a one-shot and a pipeline are not the same
+  system under test — so the comparison is the reader's to make; the suite's job
+  is to make both numbers real.
+
+  `HIVE_PROVIDER=anthropic python scripts/bench.py models` defaults to the strong
+  tier (the "just run the good model once" alternative); `--models fast strong`
+  measures the haiku one-shot too. The whole arm runs in one event loop against
+  one cumulative governor, so `HIVE_MAX_USD` bounds the total and a breach records
+  the repeats that completed. `bench.py models` stays Ollama-native for tok/s and
+  GPU placement; only the hosted path is the new one-shot.
+
 ### Fixed
 
 Three findings from a five-agent adversarial audit (2026-07-14), each a way the

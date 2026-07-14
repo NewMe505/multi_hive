@@ -305,6 +305,89 @@ def run_model(model: str, task: Task, num_ctx: int = 4096, num_predict: int = 20
     }
 
 
+async def run_oneshot(tier: str, task: Task) -> dict[str, Any]:
+    """
+    One task, one metered model call, no graph — the baseline the pipeline must beat.
+
+    This is run_model's sibling for a hosted provider. run_model talks to Ollama's
+    HTTP API directly, because its question is tok/s and GPU placement — meaningless
+    for a hosted API. Here the question is COST, so the call goes through
+    llm_factory and the governor meters it exactly as it meters a sprint. That is
+    the whole point: the one-shot's $/task and the pipeline's $/task are now the
+    same kind of number — same provider, same tokenizer, same meter — so subtracting
+    one from the other is a real measurement, not the cross-provider guess the
+    "5-8x cheaper" claim had been resting on.
+
+    The prompt is built identically to run_model's, and it is handed the editor
+    purpose deliberately: this is "the pipeline's editor with the graph removed", so
+    it must get the same system prompt and the same token budget the editor node
+    gets, or the comparison is against a straw man.
+
+    `BudgetExhausted` is a BaseException and is left to propagate: the bench arm
+    above catches it and records the repeats that completed.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from multi_hive.core.llm_factory import get_async_llm
+
+    targets = ", ".join(f"outputs/{name}" for name in task.files)
+
+    prompt = task.prompt
+    if len(task.files) > 1:
+        # The same explicit multi-file affordance run_model gives the local baseline,
+        # for the same reason: a model that CAN do the task must not score zero for
+        # want of a format, or the multi-file comparison is rigged.
+        prompt += (
+            "\n\nOutput ONE ```python code block per file, and begin each block "
+            "with a comment naming the file, exactly like:\n"
+            "# FILE: outputs/stats.py"
+        )
+
+    llm = get_async_llm("editor", tier)
+    system = get_editor_prompt(f"Write {targets}", "")
+
+    started = time.perf_counter()
+    spend_before = governor.current().snapshot()
+
+    try:
+        response = await llm.ainvoke(
+            [SystemMessage(content=system), HumanMessage(content=prompt)]
+        )
+        raw = response.content if isinstance(response.content, str) else str(response.content)
+        result = grade(_extract_files(raw, task), task)
+        failure = result.failure
+        passed = result.passed
+    except Exception as e:
+        # A model/transport error is a failed task, not a crashed benchmark — record
+        # it and move on, exactly as run_model does. (BudgetExhausted is a
+        # BaseException, so it slips past this and stops the run, which is correct.)
+        passed, failure = False, f"{type(e).__name__}: {e}"
+
+    wall = time.perf_counter() - started
+    spend = governor.spend_since(spend_before)
+
+    return {
+        "task": task.name,
+        "complexity": task.complexity,
+        "passed": passed,
+        "failure": failure,
+        "wall_sec": round(wall, 2),
+        "attempts": 1,  # one shot, by definition
+        # first_attempt_passed is None on a one-shot: "did the FIRST attempt pass" is
+        # the same question as "did it pass", so a number here would be a tautology
+        # printed in the same column as the hive's real first-attempt rate. See
+        # bench_models for the same decision on the local arm.
+        "first_attempt_passed": None,
+        "input_tokens": spend.get("input_tokens", 0),
+        "output_tokens": spend.get("output_tokens", 0),
+        "total_tokens": spend.get("total_tokens", 0),
+        "usd": spend.get("usd", 0.0),
+        # Calls the governor could not read; a cost figure from a broken meter is
+        # worse than none. _story() shouts if this is nonzero.
+        "unmetered": spend.get("unmetered", 0),
+    }
+
+
 async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
     """
     One task, through the entire graph, graded on the file that lands on disk.

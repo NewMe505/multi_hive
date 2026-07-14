@@ -9,6 +9,22 @@ bench.py — the performance tracker.
     python scripts/bench.py sprint --check      # exit 1 on a regression (CI gate)
     python scripts/bench.py history             # the trend, run by run
 
+The cost thesis, measured (both arms on the SAME provider)
+----------------------------------------------------------
+"2x the tokens on a 10x cheaper model is 5-8x cheaper for the same quality" needs
+two numbers, not one. On a hosted provider `models` stops measuring tok/s (which
+a hosted API does not have) and instead runs each task as a metered ONE-SHOT — the
+"skip the pipeline, just run the good model once" baseline the pipeline must beat:
+
+    HIVE_MAX_USD=20 HIVE_PROVIDER=anthropic python scripts/bench.py sprint --contract --repeat 3
+    HIVE_MAX_USD=20 HIVE_PROVIDER=anthropic python scripts/bench.py models --repeat 3
+
+The first records the pipeline's quality and $/task (subject hive+contract@anthropic);
+the second records the one-shot's (subject 1shot:strong@anthropic). Both go through
+the same governor and tokenizer, so their $/task is finally a subtraction, not a
+guess. `--models fast strong` also measures the haiku one-shot. Set HIVE_MAX_USD:
+the default $5 will not cover a 30-sprint x3 run.
+
 One run is a sample, not a measurement
 --------------------------------------
 The models are sampled at temperature 0.1, the retry loop is driven by whatever
@@ -107,17 +123,13 @@ def bench_models(models: list[str], repeat: int = 1) -> list[history.Run]:
     """
     # This suite talks to Ollama's HTTP API directly, on purpose: its whole job is
     # answering "which local model should back a tier?", which is a question about
-    # tok/s and GPU placement and has no meaning for a hosted API. To compare
-    # providers, use the `sprint` suite — it goes through llm_factory and measures
-    # the system, which is the thing you actually care about.
-    if PROVIDER != "ollama":
-        print(
-            f"{RED}the `models` suite is Ollama-only{RESET} (it measures tok/s and GPU "
-            f"placement, which mean nothing for {PROVIDER}).\n"
-            f"To compare providers end to end:  "
-            f"{BOLD}HIVE_PROVIDER={PROVIDER} python scripts/bench.py sprint{RESET}"
-        )
-        raise SystemExit(2)
+    # tok/s and GPU placement and has no meaning for a hosted API. main() routes a
+    # hosted provider to bench_oneshot() — the metered one-shot baseline — instead;
+    # this assert is the backstop if bench_models is ever called directly off Ollama.
+    assert PROVIDER == "ollama", (
+        "bench_models is Ollama-only (it measures tok/s and GPU placement); "
+        "hosted providers use bench_oneshot()"
+    )
 
     runs = []
     for model in models:
@@ -195,6 +207,179 @@ def bench_models(models: list[str], repeat: int = 1) -> list[history.Run]:
             )
 
         runs.append(run)
+    return runs
+
+
+def _resolve_tier(entry: str) -> str:
+    """
+    Map a --models entry to a tier for a hosted one-shot.
+
+    Accepts a tier name ("fast"/"strong") directly, or the model name that backs a
+    tier (so `--models claude-fable-5` works too). Anything else is an error that
+    names the valid choices, rather than silently benchmarking nothing.
+    """
+    if entry in MODELS:
+        return entry
+    for tier, model in MODELS.items():
+        if model == entry:
+            return tier
+    raise SystemExit(
+        f"{RED}'{entry}' is neither a tier nor a model on provider {PROVIDER}.{RESET}\n"
+        f"  tiers:  {', '.join(sorted(MODELS))}\n"
+        f"  models: {', '.join(MODELS[t] for t in sorted(MODELS))}"
+    )
+
+
+def _record_oneshot(
+    runs: list[history.Run], tier: str, results: dict[str, list[dict]], complete_reps: int
+) -> None:
+    """
+    Aggregate one tier's completed repeats into a Run — strict, exactly like the
+    other two suites: a task passes only if it passed EVERY recorded repeat.
+
+    Called with `complete_reps` = the number of repeats that ran to completion,
+    which is `repeat` normally and fewer if a budget breach cut the run short. Any
+    partial repeat's results are dropped so tasks are never scored on uneven sample
+    counts — the same rule bench_sprint applies, and for the same reason.
+    """
+    if complete_reps == 0:
+        print(f"  {RED}no complete repeat — nothing recorded for {tier}.{RESET}", flush=True)
+        return
+
+    for name in results:
+        del results[name][complete_reps:]
+
+    run = history.Run(suite="models", subject=f"1shot:{tier}@{PROVIDER}").stamp()
+    run.repeat = complete_reps
+
+    flaky: list[str] = []
+    for task in TASKS:
+        reps = results[task.name]
+        if not reps:
+            continue
+
+        passes = sum(1 for r in reps if r["passed"])
+        failures = [r["failure"] for r in reps if r["failure"]]
+        if 0 < passes < len(reps):
+            flaky.append(f"{task.name} ({passes}/{len(reps)})")
+
+        run.tasks.append(
+            {
+                "task": task.name,
+                "complexity": task.complexity,
+                "passed": passes == len(reps),  # reliably, not luckily
+                "pass_rate": round(passes / len(reps), 3),
+                "repeats": len(reps),
+                "failure": failures[0][:120] if failures else "",
+                "wall_sec": statistics.median([r["wall_sec"] for r in reps]),
+                "input_tokens": statistics.median([r.get("input_tokens", 0) for r in reps]),
+                "output_tokens": statistics.median([r.get("output_tokens", 0) for r in reps]),
+                "total_tokens": statistics.median([r.get("total_tokens", 0) for r in reps]),
+                "usd": round(statistics.median([r.get("usd", 0.0) for r in reps]), 6),
+                # SUM, not median: one unreadable call anywhere voids the cost figure.
+                "unmetered": sum(r.get("unmetered", 0) or 0 for r in reps),
+                "attempts": 1,
+                "first_attempt_passed": None,  # tautological for a one-shot; see run_oneshot
+            }
+        )
+
+    if flaky:
+        print(
+            f"\n  {BOLD}\033[33mFLAKY: {', '.join(flaky)}{RESET}\n"
+            f"  {DIM}Counted as NOT passed — `passed` means passed every run.{RESET}"
+        )
+
+    runs.append(run)
+
+
+def bench_oneshot(tiers: list[str], repeat: int = 1) -> list[history.Run]:
+    """
+    The one-shot baseline on a hosted provider — the arm the `models` suite lacked.
+
+    `models` measures tok/s and GPU placement, which a hosted API does not have, so
+    it refuses to run off Ollama — and that left the cost thesis with no baseline:
+    the pipeline's $/task was being measured against nothing, and "2x the tokens on
+    a 10x cheaper model is 5-8x cheaper" was an extrapolation, not a measurement.
+
+    This runs each task once, straight at the model through the metered llm_factory,
+    and grades it against the same hidden suite the pipeline is graded on. The result
+    is the missing half: run `sprint --contract` for the pipeline's cost, and this
+    for what it must be cheaper THAN — both real, both on the same provider, so the
+    ratio between them is finally a subtraction and not a guess.
+
+    History keeps the two on separate subjects (`1shot:<tier>@<provider>` vs
+    `hive[+contract]@<provider>`), because a one-shot and a pipeline are not the same
+    system under test — so this never auto-compares them; it makes both numbers exist.
+
+    The whole arm runs in ONE event loop (the async client's pool is bound to the
+    loop that built it) and against ONE cumulative governor, so `HIVE_MAX_USD` bounds
+    the total spend across every tier and repeat. A breach records the repeats that
+    completed and skips the rest.
+    """
+    import asyncio
+
+    from multi_hive.core.llm_factory import model_for
+
+    resolved = [_resolve_tier(t) for t in tiers]
+
+    print(f"\n{BOLD}=== one-shot baseline ({PROVIDER}) ==={RESET}", flush=True)
+    print(
+        f"  {DIM}tiers={', '.join(resolved)}  repeat={repeat}  "
+        f"(HIVE_MAX_USD bounds the total spend){RESET}",
+        flush=True,
+    )
+
+    runs: list[history.Run] = []
+
+    async def run_all() -> None:
+        for tier in resolved:
+            model = model_for(tier)
+            print(f"\n{BOLD}--- {tier} ({model}) — one shot ---{RESET}", flush=True)
+
+            results: dict[str, list[dict]] = {task.name: [] for task in TASKS}
+            completed = 0
+            try:
+                for rep in range(repeat):
+                    if repeat > 1:
+                        print(f"\n  {BOLD}run {rep + 1}/{repeat}{RESET}", flush=True)
+
+                    for task in TASKS:
+                        print(
+                            f"  {task.name:16} ({task.complexity:8}) ... ",
+                            end="",
+                            flush=True,
+                        )
+                        result = await runner.run_oneshot(tier, task)
+                        results[task.name].append(result)
+
+                        why = (
+                            f"  {DIM}({result['failure'][:40]}){RESET}"
+                            if result["failure"]
+                            else ""
+                        )
+                        cost = f"${result.get('usd', 0.0):.4f}"
+                        print(
+                            f"{result['wall_sec']:6.1f}s  "
+                            f"{result.get('total_tokens', 0):6,} tok  {cost:>9}  "
+                            f"{_mark(result['passed'])}{why}"
+                        )
+                    completed = rep + 1
+            except BudgetExhausted as e:
+                # Same contract as bench_sprint: BudgetExhausted is a BaseException
+                # that escapes run_oneshot, so record the repeats that finished and
+                # stop — the remaining tiers would only breach again immediately.
+                print(
+                    f"\n  {RED}{BOLD}BUDGET EXHAUSTED{RESET} {DIM}({e}){RESET}  "
+                    f"{DIM}recording {completed} complete repeat(s) of {repeat}; "
+                    f"remaining tiers skipped.{RESET}",
+                    flush=True,
+                )
+                _record_oneshot(runs, tier, results, completed)
+                return
+
+            _record_oneshot(runs, tier, results, repeat)
+
+    asyncio.run(run_all())
     return runs
 
 
@@ -580,7 +765,15 @@ def show_history() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("suite", choices=["models", "sprint", "history"])
-    parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        help=(
+            "ollama: model names to benchmark (default the tier pair). "
+            "hosted: tiers or model names to run as one-shot baselines (default 'strong')."
+        ),
+    )
     parser.add_argument(
         "--check",
         action="store_true",
@@ -612,11 +805,18 @@ def main() -> None:
     if args.repeat < 1:
         raise SystemExit("--repeat must be at least 1")
 
-    runs = (
-        bench_models(args.models, repeat=args.repeat)
-        if args.suite == "models"
-        else bench_sprint(contract=args.contract, repeat=args.repeat)
-    )
+    if args.suite == "sprint":
+        runs = bench_sprint(contract=args.contract, repeat=args.repeat)
+    elif PROVIDER == "ollama":
+        # The local arm: raw model prompts over the Ollama HTTP API, for tok/s and
+        # GPU placement. Default to the tier pair.
+        runs = bench_models(args.models or DEFAULT_MODELS, repeat=args.repeat)
+    else:
+        # The hosted arm: the metered one-shot baseline. Default to the STRONG tier —
+        # "skip the pipeline, just run the good model once" is the alternative the
+        # cost thesis is measured against.
+        runs = bench_oneshot(args.models or ["strong"], repeat=args.repeat)
+
     raise SystemExit(report(runs, args.check))
 
 
