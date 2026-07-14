@@ -140,9 +140,60 @@ def test_reads_ollama_eval_counts():
     assert governor._tokens_from(result) == (33, 44)
 
 
-def test_unmeterable_response_does_not_crash_the_sprint():
-    assert governor._tokens_from(_FakeResult(_FakeMessage())) == (0, 0)
-    assert governor._tokens_from(object()) == (0, 0)
+def test_an_unreadable_response_is_None_not_zero():
+    """
+    None and (0, 0) are different answers, and conflating them was the fail-open bug.
+
+    _tokens_from used to return (0, 0) for a response it could not parse, which
+    record() added as zero tokens and $0.00 — indistinguishable from a genuinely
+    free call. One change in a provider's usage field and the meter would read zero
+    forever: HIVE_MAX_USD could never trip, and an overnight loop would bill the
+    whole night while reporting it had spent nothing.
+    """
+    assert governor._tokens_from(_FakeResult(_FakeMessage())) is None
+    assert governor._tokens_from(object()) is None
+
+
+def test_a_broken_meter_stops_a_run_that_has_a_spend_ceiling(anthropic):
+    """
+    "A budget guard that fails open is not a budget guard" — governor's own docstring.
+
+    If a ceiling is computed FROM the meter and the meter has stopped working, the
+    honest response is not to keep going at $0.00/call. It is to stop, because we can
+    no longer tell what this costs, and spending money you cannot count is the exact
+    failure this module exists to prevent.
+    """
+    g = governor.reset(max_usd=5.00, max_unmetered=3)
+    m = governor.meter("claude-fable-5")
+
+    for _ in range(3):
+        m.on_llm_end(_FakeResult(_FakeMessage()))  # content, no usage reported
+
+    assert g.spend.unmetered == 3
+    assert g.spend.usd == 0.0  # ...which is precisely why it must not be trusted
+
+    with pytest.raises(BudgetExhausted, match="HIVE_MAX_UNMETERED"):
+        g.check()
+
+
+def test_a_broken_meter_does_NOT_stop_a_free_local_run():
+    """
+    The guard fires only when a ceiling DEPENDS on the meter.
+
+    HIVE_MAX_WALL_SEC and HIVE_MAX_SPRINTS are counted by the clock and by the
+    supervisor; they hold whatever the model reports. So on a free Ollama run with no
+    spend ceiling, an unreadable response costs bookkeeping accuracy and nothing else
+    — and killing the run over it would be a worse trade than carrying on.
+    """
+    g = governor.reset(max_usd=0, max_tokens=0, max_wall_sec=3600, max_unmetered=3)
+    m = governor.meter("qwen2.5-coder:7b")
+
+    for _ in range(10):
+        m.on_llm_end(_FakeResult(_FakeMessage()))
+
+    assert g.spend.unmetered == 10
+    assert not g.meter_is_load_bearing
+    g.check()  # does not raise
 
 
 def test_meter_records_on_end():

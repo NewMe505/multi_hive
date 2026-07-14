@@ -185,6 +185,13 @@ async def _work(item: discovery.WorkItem, broker: StdinBroker) -> int:
     it because "run_sprint handles its own errors" — it handles the errors it
     knows about, and this is here for the ones it does not.
     """
+    # Bracket the sprint so a crash still records what it COST. run_sprint does this
+    # itself on every path it survives — but a crash escapes before it can, and the
+    # crash record was going in with `spend: {}`. A sprint that burned $2 of Fable
+    # and then died in the retrospector was counted as $0.00 in the digest: the one
+    # number a human reads at 9am, wrong, and wrong in the reassuring direction.
+    spend_before = governor.current().snapshot()
+
     try:
         outcome = await run_sprint(
             item.objective,
@@ -202,8 +209,10 @@ async def _work(item: discovery.WorkItem, broker: StdinBroker) -> int:
             status=journal.FAILED,
             source=journal.SOURCE_ESCALATION,
             attempt=item.attempt,
+            spend=governor.spend_since(spend_before),
+            failure=f"{type(e).__name__}: {e}",
         )
-        return 1  # it advanced the counter, which is the only progress required
+        return 1
 
 
 def _ceilings() -> str:

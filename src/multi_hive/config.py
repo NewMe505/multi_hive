@@ -184,11 +184,36 @@ MAX_INPUT_CHARS = int(os.environ.get("HIVE_MAX_INPUT_CHARS", "4000"))
 #                       anthropic provider and to *unlimited* on ollama, where
 #                       the tokens cost nothing and a cap would only surprise
 #                       people.
-#   HIVE_MAX_TOKENS     total (input + output) token ceiling. Off by default —
-#                       it is the useful cap when the provider is free but the
-#                       loop can still spin, and the supervisor sets one.
+#   HIVE_MAX_TOKENS     total (input + output) token ceiling. Off by default.
+#                       It is the useful cap when the provider is free but the loop
+#                       can still spin.
 #   HIVE_MAX_WALL_SEC   wall-clock ceiling for the process.
 #   HIVE_MAX_SPRINTS    how many sprints one supervisor run may execute.
+#
+#   HIVE_MAX_UNMETERED  how many model calls may return CONTENT while reporting NO
+#                       token usage before the run is stopped. Default 3, and it
+#                       only fires when HIVE_MAX_USD or HIVE_MAX_TOKENS is set —
+#                       those are the two ceilings computed FROM the meter, so if the
+#                       meter silently reads zero, neither can ever trip. Stopping
+#                       then is not "the budget is spent", it is "I can no longer
+#                       tell", and continuing to spend money you cannot count is the
+#                       failure this module exists to prevent. See governor.breach.
+#
+# WHAT IS ON, OUT OF THE BOX
+# --------------------------
+# On `ollama` (the default provider): NOTHING. Every ceiling above is 0, so
+# Governor.breach() returns None unconditionally and the governor stops nothing.
+# That is intentional — local inference is free, and the attempt cap in discovery
+# bounds the loop's *work* regardless — but it means `multi-hive --loop` on ollama
+# has no budget guard, and the supervisor prints "ceilings: NONE SET — nothing will
+# stop this" to say so out loud.
+#
+# On `anthropic`: HIVE_MAX_USD defaults to $5. That is the one that matters, and it
+# is on by default precisely because that is the path where being wrong costs money.
+#
+# Nothing else sets a ceiling for you. An earlier version of this comment claimed
+# "the supervisor sets one" — it does not, and never did; governor.reset() is called
+# only from tests.
 #
 # See core/governor.py — the ceilings are checked *before* each model call, not
 # after. A check that fires once the tokens are already spent is an audit log,
@@ -200,6 +225,12 @@ MAX_USD = float(os.environ.get("HIVE_MAX_USD", _DEFAULT_MAX_USD))
 MAX_TOKENS = int(os.environ.get("HIVE_MAX_TOKENS", "0"))
 MAX_WALL_SEC = float(os.environ.get("HIVE_MAX_WALL_SEC", "0"))
 MAX_SPRINTS = int(os.environ.get("HIVE_MAX_SPRINTS", "0"))
+
+# Unlike the others, this one is ON by default. It is not a budget — it is the
+# guard on the budget: it stops the run when the meter itself has stopped working,
+# and only when a ceiling actually depends on the meter. A budget guard that fails
+# open is not a budget guard.
+MAX_UNMETERED = int(os.environ.get("HIVE_MAX_UNMETERED", "3"))
 
 # ── Discovery ─────────────────────────────────────────────────────────────────
 #

@@ -348,6 +348,7 @@ async def run_sprint(
         source=source,
         attempt=attempt,
         wall_time_sec=metrics.wall_time,
+        failure=final_error or "",
     )
 
     console.print(

@@ -70,6 +70,7 @@ def record_sprint(
     source: str = SOURCE_HUMAN,
     attempt: int = 1,
     wall_time_sec: float = 0.0,
+    failure: str = "",
 ) -> dict[str, Any]:
     """
     Appends one sprint to the journal and returns the record.
@@ -93,6 +94,11 @@ def record_sprint(
         "source": source,
         "attempt": attempt,
         "wall_time_sec": round(wall_time_sec, 1),
+        # WHY it failed, for the human reading the digest. Without this, parked()
+        # can only say "something underneath it broke" — which is true, useless, and
+        # exactly the kind of unactionable report that trains people to stop reading
+        # the digest at all.
+        "failure": (failure or "")[:300],
         "escalations": escalations or [],
         "spend": spend or {},
     }
