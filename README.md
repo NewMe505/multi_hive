@@ -180,7 +180,10 @@ pip install -e ".[anthropic]"
 export ANTHROPIC_API_KEY=sk-ant-...
 
 HIVE_PROVIDER=anthropic multi-hive
-HIVE_PROVIDER=anthropic python scripts/bench.py sprint    # A/B it on the benchmark
+
+# The cost comparison — both arms on the same provider, same meter, same tokenizer:
+HIVE_MAX_USD=20 HIVE_PROVIDER=anthropic python scripts/bench.py sprint --contract --repeat 3  # the pipeline
+HIVE_MAX_USD=20 HIVE_PROVIDER=anthropic python scripts/bench.py models  --repeat 3            # the one-shot baseline
 ```
 
 | tier | `ollama` (default) | `anthropic` |
@@ -196,17 +199,36 @@ and the contracts are all provider-blind — every client is handed to them by
 constructs one directly. The ladder still climbs; it just climbs *price* instead
 of *parameters*.
 
-Two things worth knowing before you switch:
+A few things worth knowing before you switch:
 
 - **The VRAM story evaporates.** Sticky tiers, the 8 GB ceiling, the dropped 14B,
   the ~23s reload on escalation — all of that is Ollama's problem and none of it
   is Claude's. The tier ratchet stays anyway, because "don't downgrade a task that
   already failed" is good routing wherever the model lives.
-- **`bench.py models` is Ollama-only** and will tell you so. It measures tok/s and
-  GPU placement, which are meaningless for a hosted API. Compare providers with
-  `sprint`, which measures the *system*. Sprint runs are recorded under a
-  provider-tagged subject (`hive@anthropic`), so an API run can never contaminate
-  the local trend line.
+- **`bench.py models` becomes the one-shot baseline** on a hosted provider. On
+  Ollama it measures tok/s and GPU placement (meaningless for a hosted API); on
+  `anthropic` it instead runs each task once, straight at the model through the
+  metered factory, and grades it against the same hidden suite — the "just run the
+  good model once" number the pipeline must beat. Recorded under
+  `1shot:<tier>@anthropic`, kept apart from the pipeline's `hive+contract@anthropic`
+  so an API run never contaminates the local trend line.
+- **Set `HIVE_MAX_USD`.** The default $5 cap will not cover a `--repeat 3` run of
+  either arm; the governor stops the run when it is hit (and now records whatever
+  repeats completed rather than crashing to zero).
+- **If Python can't reach the API** (`CERTIFICATE_VERIFY_FAILED` /
+  `APIConnectionError`) while your browser can, a TLS-inspecting antivirus or
+  corporate proxy is presenting a certificate Python's certifi bundle doesn't
+  trust. `pip install truststore` and call `truststore.inject_into_ssl()` at
+  startup to verify against the OS trust store instead — never disable
+  verification, the API key rides that connection.
+
+**Measured (2026-07-14, `--repeat 3` strict).** The haiku pipeline scored **9/9**
+at **$0.135/pass**; the fable-5 one-shot scored **6/9** at **$0.619/pass** — the
+pipeline is **~4.6× cheaper *and* higher quality**, because it runs most tasks on
+the 10×-cheaper fast model and escalates only the hard ones. On Ollama the
+conclusion inverts (the 30B one-shot is nearly as good and free), which is why this
+comparison only means anything on a *paid* provider — and why the one-shot arm had
+to exist before the "cheaper" claim could be more than an extrapolation.
 
 ## How the loop protects itself
 
@@ -264,7 +286,7 @@ matters.
 ```bash
 python scripts/bench.py sprint             # the full hive, end to end
 python scripts/bench.py sprint --contract  # ...with human-written acceptance contracts
-python scripts/bench.py models             # raw models, no graph
+python scripts/bench.py models             # raw model(s), no graph — a one-shot baseline on a hosted provider
 python scripts/bench.py history            # the trend, run by run
 python scripts/bench.py sprint --check     # exit 1 on a regression
 ```

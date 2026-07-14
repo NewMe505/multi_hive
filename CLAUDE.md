@@ -22,7 +22,7 @@ multi-hive --digest                     # what the loop did while you were aslee
 python scripts/bench.py sprint            # end-to-end; track this during development
 python scripts/bench.py sprint --contract # ...with human-written acceptance contracts
 python scripts/bench.py sprint --check    # exit 1 on a regression (CI gate)
-python scripts/bench.py models            # raw models; use when choosing a tier
+python scripts/bench.py models            # raw model, no graph — a one-shot baseline on a hosted provider
 python scripts/bench.py history           # the trend, run by run
 
 python scripts/release.py patch           # bump, changelog, commit, tag
@@ -45,6 +45,30 @@ Everything else asks it for one by `(purpose, tier)`. Do not `import ChatOllama`
 or `ChatAnthropic` anywhere else — `tests/test_llm_factory.py` scans for it and
 fails the build, because a node that builds its own client silently ignores
 `HIVE_PROVIDER` and nothing would notice until someone switched.
+
+On `anthropic` the tiers are `claude-haiku-4-5` (fast) and `claude-fable-5`
+(strong). Two things that only bite on the paid path, both handled in
+`llm_factory`: the Claude 5 family **rejects `temperature`/`top_p`/`top_k`** with a
+400 (stripped for the models that refuse them; haiku still gets it), and fable-5
+returns `.content` as a **list of blocks** (thinking always on), so
+`core.utils.flatten_message_text` flattens before any code extraction.
+
+### Running the cost comparison
+
+```bash
+HIVE_MAX_USD=20 HIVE_PROVIDER=anthropic python scripts/bench.py sprint --contract --repeat 3  # pipeline
+HIVE_MAX_USD=20 HIVE_PROVIDER=anthropic python scripts/bench.py models  --repeat 3            # one-shot baseline
+```
+
+`models` on a hosted provider runs `runner.run_oneshot` — each task once, metered,
+graded against the same hidden suite. Recorded as `1shot:<tier>@anthropic`, apart
+from the pipeline's `hive+contract@anthropic`; both go through one governor and one
+tokenizer, so their `$/task` is directly comparable. **Set `HIVE_MAX_USD`** — the
+default $5 will not cover a `--repeat 3` run. Measured 2026-07-14: pipeline 9/9 @
+$0.135/pass vs one-shot 6/9 @ $0.619/pass — the pipeline is ~4.6× cheaper and
+higher quality (the conclusion inverts vs free Ollama). If Anthropic calls fail
+with `CERTIFICATE_VERIFY_FAILED`/`APIConnectionError`, a TLS-inspecting AV/proxy is
+in the way — `truststore` is the fix, never `verify=False`.
 
 ## The loop (`--loop`)
 

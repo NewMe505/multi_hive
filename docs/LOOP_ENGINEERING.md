@@ -143,6 +143,26 @@ exists. `core/governor.py` meters every call and raises `BudgetExhausted` at the
 ceiling — and it checks *before* a call, not after, because a check that fires
 after the tokens are spent is an audit log, not a cap.
 
+**Measured, once the meter existed (2026-07-14, `--repeat 3` strict).** The 10×
+escalation multiplier is real per-escalation, but the whole-suite arithmetic is the
+opposite of alarming, because most tasks never escalate:
+
+| arm | quality | $/9-task pass | tokens/pass |
+|---|---|---|---|
+| pipeline (haiku + contract, escalating) | **9/9** | **$0.135** | 3,374 |
+| one-shot (fable-5 on every task) | 6/9 | $0.619 | 2,746 |
+
+The pipeline spends **1.84× the tokens** — the whole graph, every node metered —
+at **0.22× the cost**, because that token mix is mostly the 10×-cheaper fast model.
+Net: **~4.6× cheaper and higher quality** than just running the strong model once.
+The escalation ladder pays for itself; running everything on the expensive tier is
+the expensive option. Note this only holds on a *paid* provider — on free Ollama
+the honest advice is still "skip the pipeline, run the 30B one-shot," so the loop
+layer's economic case is provider-dependent, and now it is measured rather than
+assumed. The first paid run was also what surfaced that the strong tier had never
+actually worked on `anthropic` (two config bugs, `v4.8.0`): the meter earning its
+keep before the loop ran unattended is exactly the point.
+
 ### Verification debt
 
 Output that nobody checked, piling up in the gap between "the code runs" and "the
