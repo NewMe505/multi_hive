@@ -92,7 +92,7 @@ def get_ticket_writer_prompt() -> str:
     )
 
 
-def get_semantic_reviewer_prompt(sprint_plan: str, current_task: str) -> str:
+def get_semantic_reviewer_prompt(objective: str, sprint_plan: str, current_task: str) -> str:
     """
     Adversarial semantic review prompt.
 
@@ -100,13 +100,31 @@ def get_semantic_reviewer_prompt(sprint_plan: str, current_task: str) -> str:
     are load-bearing: without them a 7B model invents spurious complaints about
     correct code — rejecting np.float64 as a "wrong dtype" when it is exactly
     what np.max() returns.
+
+    `objective` is new, and its absence was a real bug. This reviewer used to be
+    handed only the sprint plan and the ticket — a 7B's summary, and a 7B's
+    paraphrase of that summary. The human's actual words were never given to it.
+
+    So it was asked "does this code do what was asked?" while holding a document
+    that was NOT what was asked. Code that correctly implemented the human's spec
+    but exceeded the lossy ticket got FAILed — and that verdict is injected as
+    editor_error, burns a retry, escalates the tier, and can overwrite correct code
+    with worse code.
+
+    The objective goes first and is named the authority, for the same reason it goes
+    LAST in the editor's prompt (see async_editor_node): it is the only text in this
+    system that is actually true.
     """
     return (
         "You are a code reviewer checking ONLY whether the code implements "
         "what the task asked for.\n"
         "You are NOT checking style, efficiency, or best practices.\n\n"
-        f"SPRINT PLAN CONTEXT:\n{sprint_plan}\n\n"
-        f"SPECIFIC TASK THAT WAS ASSIGNED:\n{current_task}\n\n"
+        f"THE REQUIREMENT, AS THE HUMAN WROTE IT — this is the authority:\n"
+        f"{objective}\n\n"
+        f"SPRINT PLAN CONTEXT (a summary; the requirement above outranks it):\n"
+        f"{sprint_plan}\n\n"
+        f"SPECIFIC TASK ASSIGNED (which PART of the work — not what correct means):\n"
+        f"{current_task}\n\n"
         "REVIEW RULES:\n"
         "1. Read the task. Identify every EXPLICIT requirement.\n"
         "2. Check the code implements each explicit requirement.\n"

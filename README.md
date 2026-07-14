@@ -1,4 +1,4 @@
-# 🐝 multi_hive — Sentinel Prime v4.2
+# 🐝 multi_hive — Sentinel Prime
 
 An async, self-healing, multi-file code generation hive. A LangGraph state
 machine drives a local Ollama model through plan → ticket → route → edit →

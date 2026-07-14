@@ -160,7 +160,12 @@ RECURSION_LIMIT = int(os.environ.get("HIVE_RECURSION_LIMIT", "120"))
 GATE_TIMEOUT_SEC = int(os.environ.get("HIVE_GATE_TIMEOUT", "120"))
 
 # How long generated code may run in the reviewer sandbox before it is killed.
-SANDBOX_TIMEOUT_SEC = int(os.environ.get("HIVE_SANDBOX_TIMEOUT", "10"))
+# Aligned with the grader's own 60s (bench/suite.grade). They were 10 and 60, and
+# that gap is a false rejection waiting to happen: correct code whose demo block is
+# merely slow died in the hive and passed in the bench, which is the worst possible
+# direction for a disagreement — the system rejects work its own scorer would accept.
+# If a program needs more than a minute, that is a real finding either way.
+SANDBOX_TIMEOUT_SEC = int(os.environ.get("HIVE_SANDBOX_TIMEOUT", "60"))
 
 # Cap on raw user input before it reaches any LLM context window.
 MAX_INPUT_CHARS = int(os.environ.get("HIVE_MAX_INPUT_CHARS", "4000"))

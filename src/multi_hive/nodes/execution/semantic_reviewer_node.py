@@ -118,7 +118,19 @@ async def semantic_reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
     if (state.get("loop_health") or {}).get("escalated"):
         return {}
 
+    # The human's objective — not just the 7B's paraphrase of it.
+    #
+    # This node used to be handed only the sprint plan and the ticket: a 7B's summary,
+    # and a 7B's paraphrase of that summary. The human's actual words were never given
+    # to it at all. So it was asked "does this code do what was asked?" while holding a
+    # document that was not what was asked — and code that correctly implemented the
+    # spec, but exceeded the lossy ticket, got FAILed. That verdict becomes
+    # editor_error, burns a retry, and escalates the tier.
+    human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
+    objective = human_msgs[0].content if human_msgs else ""
+
     sys_prompt = prompts.get_semantic_reviewer_prompt(
+        objective,
         state.get("sprint_plan") or "",
         state.get("current_task") or "",
     )

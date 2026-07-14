@@ -49,6 +49,22 @@ HISTORY_FILE = OUTPUTS_DIR / "bench_history.jsonl"
 
 SPEED_REGRESSION_TOLERANCE = 0.25  # 25% slower than baseline is a regression
 
+# The measured noise floor of this suite, and it is not small.
+#
+# Two runs of the IDENTICAL model at --repeat 3 have come back 9/9 and 8/9. Two runs
+# at the same commit have come back 3/4 and 1/4. A single task is a coin flip often
+# enough that a one-task difference means nothing at all.
+#
+# The quality gate has zero tolerance — code that used to be correct and is not any
+# more is a regression, full stop — and that is right. But it means a flaky task can
+# fail your build for a reason that has nothing to do with your change, and you must
+# know that before you trust the red.
+#
+# The defence is `--repeat 3` (a task passes only if it passes EVERY run) plus a
+# suite wide enough that one task is not a quarter of the score. It is nine tasks
+# now, and it should keep growing. Do not read a one-task delta as a result.
+NOISE_FLOOR_TASKS = 1
+
 
 def _git(*args: str) -> str:
     try:

@@ -118,6 +118,30 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     if previous_tier == STRONG:
         tier = STRONG
 
+    # ── The strong model gets a CLEAN SHOT ────────────────────────────────────
+    #
+    # On escalation the strong model used to inherit the fast model's broken code as
+    # `CURRENT FILE CODEBASE`, the fast model's traceback, and the order "FIX THE
+    # CODE SO IT PASSES". It was being asked to PATCH A BAD DRAFT, not to write the
+    # program — while `bench models` hands the same model a blank page and the full
+    # spec and it scores 8-9/9.
+    #
+    # So the benchmark was comparing 30B-as-patcher-of-7B-slop against
+    # 30B-as-author, and calling the gap an architectural finding.
+    #
+    # A tier escalation is a statement that the fast model's ATTEMPT was wrong. Its
+    # code is the wrongest thing in the context window, and anchoring a better model
+    # to it is the single most expensive mistake in the retry loop: the strong model
+    # is now paying VRAM, ~23s of reload, and its whole context budget to inherit a
+    # failure.
+    #
+    # The traceback survives — it says what went wrong, and that is real information —
+    # but it is reframed. "A weaker model failed like this, avoid it" is a warning.
+    # "Fix this code" is a leash.
+    escalating = bool(previous_tier) and previous_tier != tier and tier == STRONG
+    if escalating:
+        current_code = ""
+
     if tier != previous_tier:
         # "escalation", not "async_editor_node": a tier change is a routing event,
         # not a generation failure. Logging it under the editor's node name fed it
@@ -133,11 +157,21 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     # ── Prompt assembly ───────────────────────────────────────────────────────
     human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
     raw_objective = human_msgs[0].content if human_msgs else ""
-    global_objective = (
-        raw_objective[:_MAX_OBJECTIVE_CHARS] + "..."
-        if len(raw_objective) > _MAX_OBJECTIVE_CHARS
-        else raw_objective
-    )
+
+    # Truncation is LOUD now. It used to cut mid-character with no warning and no
+    # log — half your objective could vanish and nothing said so, while
+    # config.MAX_INPUT_CHARS happily accepted an objective twice this long. A
+    # silently-halved spec is indistinguishable from a model that ignored half of
+    # it, and the second is what you would have gone looking for.
+    global_objective = raw_objective
+    if len(raw_objective) > _MAX_OBJECTIVE_CHARS:
+        global_objective = raw_objective[:_MAX_OBJECTIVE_CHARS] + "..."
+        log_rejection(
+            "ticket_writer",  # not an editor feed — see _legalise_paths for why
+            f"OBJECTIVE TRUNCATED: {len(raw_objective)} chars cut to "
+            f"{_MAX_OBJECTIVE_CHARS} for the editor's context window. The dropped "
+            f"tail is: {raw_objective[_MAX_OBJECTIVE_CHARS:][:200]!r}",
+        )
 
     # Three separate failure feeds — the editor must know *which kind* of
     # failure it is fixing. Semantic rejections in particular were invisible
@@ -177,11 +211,43 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         f"EXECUTE THIS SPECIFIC TASK:{newline}{current_task}"
     )
 
-    if editor_error:
+    if editor_error and escalating:
+        # A blank page, and the previous failure as a WARNING rather than a patch
+        # target. The code that produced this traceback is deliberately not shown:
+        # you cannot be anchored to a draft you were never given.
+        user_prompt += (
+            f"{newline}{newline}A WEAKER MODEL ATTEMPTED THIS AND FAILED WITH:{newline}"
+            f"{editor_error}{newline}"
+            f"Write the program from scratch. Do NOT try to patch its code — you have "
+            f"not been shown it, and it was wrong."
+        )
+    elif editor_error:
         user_prompt += (
             f"{newline}{newline}YOUR LAST ATTEMPT FAILED WITH THIS EXACT TRACEBACK:{newline}"
             f"{editor_error}{newline}FIX THE CODE SO IT PASSES."
         )
+
+    # The human's own words, verbatim, and LAST.
+    #
+    # They used to appear only in the system prompt, high up, under a header reading
+    # "GLOBAL RULES:" — which looks like boilerplate. The terminal instruction, the
+    # thing a model weights most heavily, was `EXECUTE THIS SPECIFIC TASK: <ticket>`,
+    # and the ticket is a 7B ticket-writer's paraphrase of a 7B planner's summary of
+    # what you actually asked for.
+    #
+    # Every trap in this benchmark is exactly the kind of clause a paraphrase drops:
+    # "touching intervals count as overlapping", "a word longer than width must be
+    # hard-split", "ties are broken alphabetically". The model was being graded on
+    # requirements it was never shown.
+    #
+    # So the requirement goes last, verbatim, and it is named as the authority. The
+    # ticket stays — it says which FILE and which part of the work — but where the
+    # two disagree, the human wins.
+    user_prompt += (
+        f"{newline}{newline}THE FULL REQUIREMENT, EXACTLY AS THE HUMAN WROTE IT.{newline}"
+        f"The task above says which part of the work to do. THIS says what correct "
+        f"means. Where they disagree, this wins:{newline}{global_objective}"
+    )
 
     # ── Generation ────────────────────────────────────────────────────────────
     try:
