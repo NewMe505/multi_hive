@@ -409,13 +409,26 @@ def _tokens_from(response: Any) -> tuple[int, int] | None:
 
     message = getattr(generation, "message", None)
 
+    # A populated usage object that still reads (0, 0) is NOT a free call, and
+    # counting it as one is the fail-open hole this guard exists to close — only
+    # half-closed. `if usage:` catches the absent/empty case, but a *present* dict
+    # whose token sub-keys were renamed or dropped upstream (langchain builds
+    # UsageMetadata with `getattr(..., "input_tokens", 0) or 0`, so a schema change
+    # yields a truthy {input_tokens: 0, output_tokens: 0}) sails through `.get(...,
+    # 0)` as (0, 0) and is metered at $0.00 forever. A real completed call always
+    # has input tokens; (0, 0) means we could not read it. Fall through to
+    # `record_unmetered` in that case, exactly as an absent usage object does.
     usage = getattr(message, "usage_metadata", None)
     if usage:
-        return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+        tokens = int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+        if tokens != (0, 0):
+            return tokens
 
     meta = getattr(message, "response_metadata", None) or {}
     if "eval_count" in meta or "prompt_eval_count" in meta:
-        return int(meta.get("prompt_eval_count", 0)), int(meta.get("eval_count", 0))
+        tokens = int(meta.get("prompt_eval_count", 0)), int(meta.get("eval_count", 0))
+        if tokens != (0, 0):
+            return tokens
 
     return None
 

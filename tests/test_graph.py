@@ -252,6 +252,48 @@ def test_the_file_anchor_survives_contract_mode():
     assert user.rindex("YOU ARE WRITING EXACTLY ONE FILE") > user.rindex("for CONTEXT")
 
 
+def test_a_generation_exception_bumps_the_retry_counter():
+    """
+    A generation-level exception (the client throws) is a non-incrementing failure
+    exit unless it says otherwise — and it used to not say otherwise, unlike its
+    empty-extraction sibling. That leaves MAX_RETRIES unreachable, and the
+    repeat-error breaker cannot be leaned on because it matches on error TEXT: a
+    hosted-API error carries a varying request id, so consecutive failures hash
+    differently and never trip it. The result is a silent loop to RECURSION_LIMIT
+    that burns real tokens and never reaches the human gate.
+
+    The counter MUST advance on this exit, exactly as it does on empty extraction.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from langchain_core.messages import HumanMessage
+
+    from multi_hive.nodes.execution import async_editor_node as mod
+
+    class _ThrowingLLM:
+        async def ainvoke(self, messages):
+            # A message that VARIES per call, like a real API error's request id —
+            # so the repeat-error fingerprint cannot rescue a missing increment.
+            raise RuntimeError("overloaded_error (request req_" + str(id(messages)) + ")")
+
+    with patch.object(mod, "get_async_llm", lambda *a, **k: _ThrowingLLM()):
+        out = asyncio.run(
+            mod.async_editor_node(
+                {
+                    "current_task": "implement top_words",
+                    "active_file": "outputs/stats.py",
+                    "messages": [HumanMessage(content="Save it to outputs/stats.py")],
+                    "project_files": {},
+                    "editor_retries": 2,
+                }
+            )
+        )
+
+    assert out["editor_error"], "the exception must surface as an editor_error"
+    assert out["editor_retries"] == 3, "the retry counter must advance so MAX_RETRIES is reachable"
+
+
 def test_the_strong_model_gets_a_blank_page_on_escalation():
     """
     Finding 11. On escalation the strong model used to inherit the fast model's

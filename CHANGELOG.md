@@ -11,6 +11,44 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
+### Fixed
+
+Three findings from a five-agent adversarial audit (2026-07-14), each a way the
+system spends real money on the anthropic provider without the guard that is
+supposed to stop it.
+
+- **The benchmark discarded a whole paid run when it hit the budget cap.** The
+  bench's `run_sprint` (`bench/runner.py`) catches `except Exception`, but
+  `BudgetExhausted` is a `BaseException` by design — so a budget stop escaped it,
+  unwound through `asyncio.run`, and killed the process before a single number was
+  recorded. On a 30-sprint `sprint --contract --repeat 3` against Claude, tripping
+  the default `$5` cap on the last sprint threw away the other 29. The bench now
+  catches it, records every repeat that ran to completion, and discards only the
+  repeat the breach interrupted — never aggregating tasks with uneven sample
+  counts, which would reintroduce the order-dependent scoring the suite exists to
+  prevent. Zero complete repeats records nothing and says so.
+
+- **A generation exception in the editor never advanced the retry counter.**
+  `async_editor_node`'s exception exit set `editor_error` but, unlike its
+  empty-extraction sibling, did not bump `editor_retries` — so `MAX_RETRIES` was
+  unreachable on that path. The repeat-error fingerprint could not cover for it
+  either: it matches on error *text*, and a hosted-API error carries a varying
+  request id, so consecutive failures hash differently and never trip it. A
+  persistent generation exception (far likelier on `anthropic` than on local
+  Ollama) looped silently to `RECURSION_LIMIT`, burning real tokens on every
+  cycle and never reaching the human gate. The counter now advances on that exit.
+
+- **The governor's fail-open guard was only half closed.** `_tokens_from`
+  returned `None` for an absent usage object — counted as unreadable, correct —
+  but a *present* usage object whose token sub-keys were renamed or dropped
+  upstream reads `(0, 0)` through `.get(..., 0)` and was metered as a genuine
+  free call. langchain builds `UsageMetadata` with `getattr(u, "input_tokens", 0)
+  or 0`, so one upstream schema change emits exactly this truthy all-zero dict,
+  and from then on `HIVE_MAX_USD` never grows while an overnight loop bills the
+  night reporting `$0.00`. A completed call always spends input tokens, so `(0,
+  0)` is now treated as unreadable, not free; a genuinely one-sided reading (a
+  cache-read prompt: 0 input, real output) is still a real reading.
+
 ## [4.7.0] - 2026-07-14
 
 ### Added

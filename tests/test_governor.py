@@ -154,6 +154,35 @@ def test_an_unreadable_response_is_None_not_zero():
     assert governor._tokens_from(object()) is None
 
 
+def test_a_present_but_zeroed_usage_object_is_unreadable_not_free():
+    """
+    The other half of the fail-open bug: `if usage:` is truthy for a populated
+    dict, so a usage object whose token sub-keys were renamed or dropped upstream
+    reads (0, 0) via `.get(..., 0)` and used to be metered as a genuine free call.
+
+    langchain builds UsageMetadata with `getattr(u, "input_tokens", 0) or 0`, so a
+    single upstream schema change emits exactly this: a truthy
+    {input_tokens: 0, output_tokens: 0}. A real completed call always spends input
+    tokens, so (0, 0) means unreadable, and it must be counted as such — otherwise
+    HIVE_MAX_USD stops binding while the digest reports $0.00.
+    """
+    both_zero = _FakeResult(_FakeMessage(usage_metadata={"input_tokens": 0, "output_tokens": 0}))
+    assert governor._tokens_from(both_zero) is None
+
+    renamed = _FakeResult(_FakeMessage(usage_metadata={"prompt_tokens": 11, "completion_tokens": 22}))
+    assert governor._tokens_from(renamed) is None
+
+    ollama_zero = _FakeResult(
+        _FakeMessage(response_metadata={"prompt_eval_count": 0, "eval_count": 0})
+    )
+    assert governor._tokens_from(ollama_zero) is None
+
+    # A genuinely one-sided reading is still a real reading, not unreadable: a
+    # fully cache-read prompt can legitimately report 0 input with real output.
+    one_sided = _FakeResult(_FakeMessage(usage_metadata={"input_tokens": 0, "output_tokens": 22}))
+    assert governor._tokens_from(one_sided) == (0, 22)
+
+
 def test_a_broken_meter_stops_a_run_that_has_a_spend_ceiling(anthropic):
     """
     "A budget guard that fails open is not a budget guard" — governor's own docstring.

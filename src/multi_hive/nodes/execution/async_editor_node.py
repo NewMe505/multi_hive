@@ -378,6 +378,15 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
         )
         return {
             "editor_error": str(e),
+            # Bump the counter, exactly as the empty-extraction exit above does and
+            # for the same reason: this is a non-incrementing failure exit, and
+            # MAX_RETRIES is the ONLY backstop that survives it. The repeat-error
+            # fingerprint cannot be relied on here — it matches on error TEXT, and a
+            # hosted-API error (e.g. anthropic) routinely carries a varying request
+            # id, so consecutive failures hash differently and never trip it. Without
+            # this increment a persistent generation exception loops silently to
+            # RECURSION_LIMIT, burning real tokens and never reaching the human gate.
+            "editor_retries": state.get("editor_retries", 0) + 1,
             "loop_health": loop_health,
             "model_tier": tier,
             "task_complexity": complexity,

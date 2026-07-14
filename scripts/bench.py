@@ -59,6 +59,7 @@ from multi_hive.bench import history, runner  # noqa: E402
 from multi_hive.bench.contracts import contract_for_task  # noqa: E402
 from multi_hive.bench.suite import TASKS  # noqa: E402
 from multi_hive.config import MODELS, PROVIDER  # noqa: E402
+from multi_hive.core.governor import BudgetExhausted  # noqa: E402
 
 DEFAULT_MODELS = ["qwen2.5-coder:7b", "qwen3-coder:30b"]
 
@@ -231,7 +232,15 @@ def bench_sprint(contract: bool = False, repeat: int = 1) -> list[history.Run]:
     # task name -> one result per repeat
     results: dict[str, list[dict]] = {task.name: [] for task in TASKS}
 
+    # How many repeats ran to completion. A repeat that a budget breach cut off
+    # partway is NOT counted: its tasks have uneven sample counts (the ones before
+    # the breach ran, the ones after did not), and _aggregate's `passed == passed
+    # every run` would then judge different tasks on different numbers of samples —
+    # the exact order-dependent, invented-failure class this suite exists to avoid.
+    completed_repeats = 0
+
     async def run_all() -> None:
+        nonlocal completed_repeats
         """
         Every task, every repeat, in ONE event loop.
 
@@ -282,7 +291,34 @@ def bench_sprint(contract: bool = False, repeat: int = 1) -> list[history.Run]:
                     f"tier={tiers:12} {_mark(result['passed'])}{gate}{why}"
                 )
 
-    asyncio.run(run_all())
+            completed_repeats = rep + 1
+
+    # `run_sprint` catches `except Exception`, but `BudgetExhausted` is a
+    # BaseException by design (so a budget stop is never mistaken for an editor
+    # error and retried). It therefore escapes to here. Without this handler it
+    # would unwind straight through `asyncio.run` and kill the process before a
+    # single number was recorded — the whole point of a 30-sprint paid run, lost
+    # for the last one that happened to trip the cap. Record the repeats that DID
+    # finish, and say plainly that the run was cut short.
+    try:
+        asyncio.run(run_all())
+    except BudgetExhausted as e:
+        print(
+            f"\n  {RED}{BOLD}BUDGET EXHAUSTED{RESET} {DIM}({e}){RESET}\n"
+            f"  {DIM}Recording {completed_repeats} complete repeat(s) of {repeat} "
+            f"requested; the interrupted repeat is discarded.{RESET}",
+            flush=True,
+        )
+        if completed_repeats == 0:
+            print(
+                f"  {RED}No complete repeat finished — nothing recorded. "
+                f"Raise HIVE_MAX_USD and re-run.{RESET}",
+                flush=True,
+            )
+            return []
+        for name in results:
+            del results[name][completed_repeats:]
+        return [_aggregate(results, contract, completed_repeats)]
 
     return [_aggregate(results, contract, repeat)]
 
