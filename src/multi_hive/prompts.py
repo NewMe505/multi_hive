@@ -118,18 +118,38 @@ def get_semantic_reviewer_prompt(sprint_plan: str, current_task: str) -> str:
         "- the presence of extra helper functions beyond what the task specifies.\n"
         "- coding style, variable names, or implementation approach.\n"
         "- assert statements or test code in the execution block.\n\n"
+        # The save-path rule — "a file path specified in the task is not used", and
+        # its worked example "FAIL: file saved to src/ but task specified
+        # outputs/dsp_pipeline.py" — has been REMOVED, and its absence is
+        # load-bearing.
+        #
+        # This reviewer's user message is ONLY the code. semantic_reviewer_node
+        # sends [SystemMessage(prompt), HumanMessage(current_code)] and nothing
+        # else — it cannot see active_file and never could. So it was being handed
+        # a rule it had no way to evaluate, plus a worked example of how to fail on
+        # it, and the only way to comply was to guess. That is not a review, it is
+        # an invitation to hallucinate.
+        #
+        # The path is not its job in any case: normalise_model_path() is the entry
+        # boundary and safe_path() is the write boundary. Both are deterministic,
+        # both run in code, and neither wants a 7B's opinion. Every false rejection
+        # from this node burns a retry, escalates the tier, and can overwrite
+        # correct code with worse code — so a rule it cannot evaluate is not a
+        # harmless one.
         "ONLY REJECT if the code is MISSING something the task EXPLICITLY requires:\n"
         "- a function that was explicitly named in the task is absent\n"
-        "- a file path specified in the task is not used\n"
         "- a required behaviour (e.g. delay effect) is completely absent\n\n"
+        "You are shown the CODE ONLY. You cannot see what file it was written to, "
+        "so NEVER reject on a filename or save path — you have no way to know, and "
+        "guessing is a false rejection.\n\n"
         "Examples of correct FAIL responses:\n"
         "  FAIL: apply_delay function is missing, only generate_sine_wave is implemented\n"
-        "  FAIL: file saved to src/ but task specified outputs/dsp_pipeline.py\n"
         "  FAIL: compute_max_amplitude function is absent from the code\n\n"
         "Examples of WRONG FAIL responses (do NOT do these):\n"
         "  FAIL: Output dtype is incorrect  <- WRONG, np.float64 is correct for np.max()\n"
         "  FAIL: function should use a different algorithm  <- WRONG, style not checked\n"
-        "  FAIL: missing docstrings  <- WRONG, not an explicit requirement\n\n"
+        "  FAIL: missing docstrings  <- WRONG, not an explicit requirement\n"
+        "  FAIL: file saved to the wrong path  <- WRONG, you cannot see the path\n\n"
         "CODE TO REVIEW:\n"
     )
 

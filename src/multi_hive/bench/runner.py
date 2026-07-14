@@ -234,6 +234,10 @@ async def run_sprint(task: Task, contract: str = "") -> dict[str, Any]:
                     tiers.append(delta["model_tier"])
                 if "loop_health" in delta:
                     escalated = escalated or bool((delta["loop_health"] or {}).get("escalated"))
+                # Sticky. agent_router_node resets loop_health when a sprint
+                # continues past a gate to the next task, so the OR above can miss
+                # an escalation that was followed by more work.
+                escalated = escalated or bool(delta.get("sprint_escalated"))
                 if "editor_error" in delta:
                     error = delta["editor_error"]
                 if delta.get("contract_satisfied") is not None:

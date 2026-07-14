@@ -9,7 +9,8 @@ sprint_planner → ticket_writer → agent_router_node → async_editor_node
                                            → human_gate_node     (escalate)
                                            → agent_router_node   (next task)
                                            → retrospector_node   (done)
-  human_gate_node → retrospector_node → END
+  human_gate_node → [conditional] → agent_router_node   (skip it; more work left)
+                                  → retrospector_node   (that was the last task)
 
 The two reviewers verify different things and both must pass before the graph
 advances. reviewer_node verifies *execution*: the code runs and its own
@@ -80,6 +81,28 @@ def reviewer_logic(state: HiveState) -> str:
     return "retrospector_node"
 
 
+def gate_logic(state: HiveState) -> str:
+    """
+    Where the sprint goes after a human gate.
+
+    This used to be an unconditional edge to the retrospector, because
+    human_gate_node returned `task_queue: []` — an escalation on ticket 1 of 3
+    silently cancelled tickets 2 and 3, and the sprint ended having never attempted
+    them.
+
+    The gate now skips the failed task and keeps the queue, so there may be work
+    left. If there is, the sprint continues at agent_router_node — which resets
+    loop_health, clearing `escalated` so reviewer_logic does not route straight back
+    here and spin.
+
+    The escalation is NOT forgotten by that reset: human_gate_node sets
+    `sprint_escalated`, which nothing ever clears, and that is what the CLI, the
+    retrospector and the bench report. The sprint finishes the work it can and still
+    tells the operator a human is needed.
+    """
+    return "agent_router_node" if state.get("current_task") else "retrospector_node"
+
+
 def build_graph() -> StateGraph:
     """
     Wires and compiles the graph.
@@ -106,7 +129,7 @@ def build_graph() -> StateGraph:
     workflow.add_edge("async_editor_node", "reviewer_node")
     workflow.add_edge("reviewer_node", "semantic_reviewer_node")
     workflow.add_conditional_edges("semantic_reviewer_node", reviewer_logic)
-    workflow.add_edge("human_gate_node", "retrospector_node")
+    workflow.add_conditional_edges("human_gate_node", gate_logic)
     workflow.add_edge("retrospector_node", END)
 
     return workflow.compile()
