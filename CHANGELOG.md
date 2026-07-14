@@ -11,204 +11,6 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## [Unreleased]
 
-### Changed
-
-- **`HIVE_SANDBOX_TIMEOUT` default is now 30s (was 10s).** The old 10s was 6x
-  stricter than the grader's 60s, so correct code whose demo block was merely slow
-  died in the hive and passed in the bench — the system rejecting work its own scorer
-  would accept, which is the worst direction for a disagreement. But 60s was the
-  wrong correction: `suite.grade()` pays its 60s ONCE, on the final artefact, while
-  this sandbox runs on EVERY editor attempt. At 60s a model that emits `while True`
-  costs 240s per task instead of 40. 30s clears any legitimate demo block and stays
-  bounded.
-
-- **The benchmark reports the story, not just the score.** `sprint` now records
-  tokens, USD, editor attempts, whether the FIRST file written already passed, and
-  whether the sprint ever produced a passing file and then shipped something else.
-  "9/9 passed" hides everything that matters: two systems can both score 9/9 while one
-  gets it right first time for 4k tokens and the other thrashes for 40k.
-
-  The last of those — `DISCARDED A PASSING ANSWER` — measured a failure mode that was
-  structurally invisible, because the bench only ever graded the LAST file on disk. It
-  came back **zero**, which is why best-attempt retention was NOT built. Measuring
-  before building saved that day.
-
-### Added
-
-- **`HIVE_PLAN_TIER`** — pins the planner and ticket writer to a tier. The plan decides
-  what the task IS, and everything downstream executes that paraphrase; a bad ticket
-  cannot be rescued by escalating the editor. Defaults to unset: measured on ollama it
-  was **1.80x slower for zero quality gain** (the 7B/30B VRAM swap), and it ships as a
-  knob rather than a default because of it. On `anthropic` there is no swap and it is
-  very likely right — but that is unmeasured, and this project has twice reverted a
-  change that was obviously right.
-
-- **`word_stats`** — the first bench task the hive is actually FOR. Two files, and the
-  graded module IMPORTS the other, so the model must hold an interface neither file
-  states alone. Every other task is one self-contained function — exactly what a
-  one-shot prompt is best at, and exactly where a pipeline has nothing to add.
-
-### Fixed
-
-- **The 7B decided what every task was, and nothing could override it.**
-  `sprint_planner` and `ticket_writer` called `get_llm()` with no tier, which silently
-  defaults to `fast`. So `HIVE_FORCE_TIER` never reached them and neither did the
-  escalation ladder — "the hive on the strong model" was never true. And a ticket-writer
-  JSON parse failure does not fail a task, it kills the whole SPRINT: measured killing
-  `lru_cache --contract` on three runs out of three. Both nodes route their tier now,
-  and the ticket writer retries once on the strong model.
-
-- **The spec never reached the people judging the work.** The editor's terminal
-  instruction was `EXECUTE THIS SPECIFIC TASK: <ticket>` — a paraphrase of a summary —
-  and the semantic reviewer was never given the objective at all. Every trap in the
-  benchmark is exactly the clause a paraphrase drops ("ties are broken alphabetically",
-  "touching intervals count as overlapping"). The requirement now goes to the editor
-  last and verbatim, and to the reviewer first, as the authority. **Measured: 6/9 → 7/9,
-  with `semver` going from a coin flip to 3/3.**
-
-- **The strong model never got a clean shot.** On escalation it inherited the fast
-  model's broken code and the order "FIX THE CODE SO IT PASSES" — asked to patch a bad
-  draft, while `bench models` hands the same model a blank page and it scores 8-9/9. It
-  gets a blank page now; the traceback survives as a warning, not a leash.
-
-- **An escalation cancelled every file behind it.** `human_gate_node` returned
-  `task_queue: []`, so one hard file poisoned every easy file queued behind it — in a
-  project whose premise is MULTI-file generation. It skips the failed task and keeps
-  the queue, with a sticky `sprint_escalated` flag so a sprint that carries on cannot
-  quietly report itself CLEAN.
-
-- **Five grader bugs, every one of them favouring the pipeline.** The multi-file task
-  scored the one-shot 30B "no code" three times running. It was not "no code" — the
-  extractor demanded exact `# FILE:` labels, then only read fenced output (the 30B
-  emits none), the grader flattened the workspace layout so `from outputs.tokens import`
-  raised ModuleNotFoundError, and the delegation check asserted a literal module name so
-  a correct import was failed for its SPELLING. A benchmark whose errors all flatter the
-  conclusion is not a benchmark.
-
-- **`clean_workspace()` could delete the user's source tree.** It recursively unlinks
-  every `*.py` under `HIVE_WORKSPACE`, which was unvalidated — and the README says
-  "Relocate it with `HIVE_WORKSPACE=/some/path`". `HIVE_WORKSPACE=.` would have deleted
-  the entire `multi_hive` package. A workspace that is, or contains, this source tree —
-  or is `$HOME`, or a filesystem root — is now refused at import.
-
-- **The governor failed open.** `_tokens_from` returned `(0, 0)` for any response it
-  could not parse, which `record()` added as $0.00 — indistinguishable from a free call.
-  One change to a provider's usage field and the meter reads zero forever while an
-  overnight loop bills the night. Unreadable is now counted as unreadable, and
-  `HIVE_MAX_UNMETERED` stops the run when a ceiling that DEPENDS on the meter can no
-  longer be trusted.
-
-- **One crashed item abandoned the whole backlog.** A crash does not advance the attempt
-  counter, so the item reappeared forever — and the supervisor's repeat-detector
-  responded by breaking out of the entire loop. Items B and C never ran because item A
-  kept crashing. A stuck item is a fact about that item; it is skipped now, not fatal.
-
-- Objective truncation is logged instead of silently cutting mid-character. The sandbox
-  no longer disagrees with its own grader. `semantic_reviewer` is no longer invited to
-  reject on a save path it structurally cannot see.
-
-
-### Fixed
-
-- **The benchmark was contaminated, and every sprint number this project has ever
-  recorded was taken through a dirty lens.**
-
-  `clear_ledger()` had exactly one caller in the codebase — `cli.py` — so a bench
-  run never cleared it. And `get_recent_rejections()` filters by **node name only**:
-  no task scoping, no run scoping. It returns the last three failures for that node
-  *from the whole file*.
-
-  So the `word_wrap` editor was handed `semver`'s traceback, under the heading
-  "PAST RUNTIME/ASSERTION FAILURES — your code ran but produced wrong results. Fix
-  the logic", and told to fix a bug in a file it was not writing. The ledger was
-  found **221 lines deep, spanning multiple tasks and multiple sessions.**
-
-  Three consequences, each of which invalidates the measurement:
-
-  - **The suite was order-dependent.** Task 4 carried tasks 1–3's failures into its
-    context; task 1 carried none. Reordering `TASKS` changed the score.
-  - **The repeats were not independent samples.** Run 2 began with run 1's failures
-    already in the editor's prompt — which voids the entire point of
-    `passed == passed every run`, the rule this benchmark otherwise defends more
-    carefully than anything else in it.
-  - **A run was not reproducible from a clean checkout.** The score depended on
-    ledger residue from whatever was run yesterday.
-
-  And `run_model` never touches the ledger, so the whole penalty fell on `sprint`
-  and never on `models` — a one-directional bias in precisely the comparison the
-  two suites exist to support. `bench/runner.clean_workspace()` now empties the
-  ledger and removes generated `*.py` and `__pycache__` before every task. The
-  hive's own records (`bench_history.jsonl` above all) are deliberately left alone.
-
-- **Only the graded artefact was cleaned between tasks.** Everything else survived,
-  and the reviewer sandbox runs with `PYTHONPATH=WORKSPACE_DIR` — so a module left
-  behind by an earlier task could shadow an import and let a task pass on
-  *yesterday's code*. The whole workspace is now cleaned.
-
-- **`--repeat` was silently ignored by the `models` suite.** Every models number
-  ever recorded is a single sample, and those samples were being read next to
-  sprint's strict pass-every-run aggregate — which is not a comparison, it is a
-  category error. `models` now honours `--repeat` and applies the same rule.
-  Expect the 30B to settle at **3/4, not the 4/4 that has been quoted**: at commit
-  `18e4dab` it already scored 3/4 with `semver` failing. The 4/4 was a coin landing
-  heads.
-
-- **The `[CONTRACT GAMED]` detector could cry wolf.** `_aggregate` stored
-  `contract_satisfied` with `any()` while `passed` used `all()`, so a row could
-  read `contract_satisfied=True, passed=False` assembled from two *different*
-  repeats — the exact gaming signature, manufactured out of ordinary flakiness with
-  no gaming anywhere. It aggregates with `all()` now. A detector that cries wolf
-  gets ignored, and then it is not a detector.
-
-- **The regression gate fired on task-count changes, not regressions.**
-  `quality_regression` was `quality_delta < 0` — a raw count difference. Add a task
-  to `TASKS` and every later run looks like an improvement; remove one and every
-  later run looks like a regression. It is now driven by `regressed_tasks`, matched
-  by name over the shared set, so it survives the suite growing or shrinking — and
-  when it fires it names the task that broke.
-
-### Fixed
-
-- **The planner could hand the graph a file it was never allowed to write, and the
-  hive would spend its entire retry budget failing to.** Model-authored paths were
-  validated at the *write* boundary (`safe_path`) and nowhere else — so an illegal
-  path was only caught after a full generation had been paid for against it.
-
-  Worse than the wasted inference was where the error went. `reviewer_node` raised
-  `FILE SYSTEM ERROR: Path traversal blocked: 'test_add.py'`, that became an
-  `editor_error`, and the editor was handed it with *"FIX THE CODE SO IT PASSES."*
-  But the code was never wrong. The **path** was wrong, and the path lives in
-  `active_file`, which the editor cannot change. No output the model can produce
-  fixes it — so every retry regenerated the same file for the same illegal path,
-  failed identically, burned `MAX_RETRIES`, and escalated to a human for a problem
-  no human was needed for. Observed live on a two-line `add(a, b)`: four
-  generations and an escalation, for a task the 7B solves first try.
-
-  `core/utils.normalise_model_path()` is now the **entry** boundary, enforced in
-  `ticket_writer` across the whole queue (not just `tasks[0]` — every path in it
-  becomes `active_file` eventually, as `semantic_reviewer_node` retires tasks, so
-  validating only the first would have moved the bug deeper into the sprint where
-  it costs more).
-
-  It widens exactly one case: a **bare filename** has no directory component, so
-  the model's intent is not in question — it meant a workspace file and forgot to
-  say where — and `outputs/` is deterministic, not a guess. **Everything else
-  `safe_path` would refuse is still refused.** A traversal has a directory
-  component, so it is not a bare filename, so it falls straight through to
-  `safe_path` and is rejected: normalisation must never launder a path, and
-  `tests/test_safe_path.py` pins that. Unfixable tickets are dropped and logged; a
-  plan with no writable file at all now fails loudly instead of spinning.
-
-  Both outcomes log under `ticket_writer`, which none of the editor's three failure
-  feeds read. Handing the editor a routing complaint and telling it to "fix the
-  code structure" is the same category error the repeat-error breaker was already
-  taught once.
-
-  The ticket-writer prompt now names the failure explicitly too — but the prompt
-  already said "paths must start with 'src/' or 'outputs/'" and the model emitted
-  `test_add.py` anyway. A prompt is not a guarantee. That is why this is enforced
-  in code.
-
 ### Added
 
 - **The hive runs itself.** `multi-hive --loop` discovers its own work, does it,
@@ -326,7 +128,200 @@ tags. See [CONTRIBUTING.md](CONTRIBUTING.md).
   downgrade a task that has already failed" is good routing wherever the model
   lives.
 
+- **`HIVE_PLAN_TIER`** — pins the planner and ticket writer to a tier. The plan decides
+  what the task IS, and everything downstream executes that paraphrase; a bad ticket
+  cannot be rescued by escalating the editor. Defaults to unset: measured on ollama it
+  was **1.80x slower for zero quality gain** (the 7B/30B VRAM swap), and it ships as a
+  knob rather than a default because of it. On `anthropic` there is no swap and it is
+  very likely right — but that is unmeasured, and this project has twice reverted a
+  change that was obviously right.
+
+- **`word_stats`** — the first bench task the hive is actually FOR. Two files, and the
+  graded module IMPORTS the other, so the model must hold an interface neither file
+  states alone. Every other task is one self-contained function — exactly what a
+  one-shot prompt is best at, and exactly where a pipeline has nothing to add.
+
+### Changed
+
+- **`HIVE_SANDBOX_TIMEOUT` default is now 30s (was 10s).** The old 10s was 6x
+  stricter than the grader's 60s, so correct code whose demo block was merely slow
+  died in the hive and passed in the bench — the system rejecting work its own scorer
+  would accept, which is the worst direction for a disagreement. But 60s was the
+  wrong correction: `suite.grade()` pays its 60s ONCE, on the final artefact, while
+  this sandbox runs on EVERY editor attempt. At 60s a model that emits `while True`
+  costs 240s per task instead of 40. 30s clears any legitimate demo block and stays
+  bounded.
+
+- **The benchmark reports the story, not just the score.** `sprint` now records
+  tokens, USD, editor attempts, whether the FIRST file written already passed, and
+  whether the sprint ever produced a passing file and then shipped something else.
+  "9/9 passed" hides everything that matters: two systems can both score 9/9 while one
+  gets it right first time for 4k tokens and the other thrashes for 40k.
+
+  The last of those — `DISCARDED A PASSING ANSWER` — measured a failure mode that was
+  structurally invisible, because the bench only ever graded the LAST file on disk. It
+  came back **zero**, which is why best-attempt retention was NOT built. Measuring
+  before building saved that day.
+
 ### Fixed
+
+- **The 7B decided what every task was, and nothing could override it.**
+  `sprint_planner` and `ticket_writer` called `get_llm()` with no tier, which silently
+  defaults to `fast`. So `HIVE_FORCE_TIER` never reached them and neither did the
+  escalation ladder — "the hive on the strong model" was never true. And a ticket-writer
+  JSON parse failure does not fail a task, it kills the whole SPRINT: measured killing
+  `lru_cache --contract` on three runs out of three. Both nodes route their tier now,
+  and the ticket writer retries once on the strong model.
+
+- **The spec never reached the people judging the work.** The editor's terminal
+  instruction was `EXECUTE THIS SPECIFIC TASK: <ticket>` — a paraphrase of a summary —
+  and the semantic reviewer was never given the objective at all. Every trap in the
+  benchmark is exactly the clause a paraphrase drops ("ties are broken alphabetically",
+  "touching intervals count as overlapping"). The requirement now goes to the editor
+  last and verbatim, and to the reviewer first, as the authority. **Measured: 6/9 → 7/9,
+  with `semver` going from a coin flip to 3/3.**
+
+- **The strong model never got a clean shot.** On escalation it inherited the fast
+  model's broken code and the order "FIX THE CODE SO IT PASSES" — asked to patch a bad
+  draft, while `bench models` hands the same model a blank page and it scores 8-9/9. It
+  gets a blank page now; the traceback survives as a warning, not a leash.
+
+- **An escalation cancelled every file behind it.** `human_gate_node` returned
+  `task_queue: []`, so one hard file poisoned every easy file queued behind it — in a
+  project whose premise is MULTI-file generation. It skips the failed task and keeps
+  the queue, with a sticky `sprint_escalated` flag so a sprint that carries on cannot
+  quietly report itself CLEAN.
+
+- **Five grader bugs, every one of them favouring the pipeline.** The multi-file task
+  scored the one-shot 30B "no code" three times running. It was not "no code" — the
+  extractor demanded exact `# FILE:` labels, then only read fenced output (the 30B
+  emits none), the grader flattened the workspace layout so `from outputs.tokens import`
+  raised ModuleNotFoundError, and the delegation check asserted a literal module name so
+  a correct import was failed for its SPELLING. A benchmark whose errors all flatter the
+  conclusion is not a benchmark.
+
+- **`clean_workspace()` could delete the user's source tree.** It recursively unlinks
+  every `*.py` under `HIVE_WORKSPACE`, which was unvalidated — and the README says
+  "Relocate it with `HIVE_WORKSPACE=/some/path`". `HIVE_WORKSPACE=.` would have deleted
+  the entire `multi_hive` package. A workspace that is, or contains, this source tree —
+  or is `$HOME`, or a filesystem root — is now refused at import.
+
+- **The governor failed open.** `_tokens_from` returned `(0, 0)` for any response it
+  could not parse, which `record()` added as $0.00 — indistinguishable from a free call.
+  One change to a provider's usage field and the meter reads zero forever while an
+  overnight loop bills the night. Unreadable is now counted as unreadable, and
+  `HIVE_MAX_UNMETERED` stops the run when a ceiling that DEPENDS on the meter can no
+  longer be trusted.
+
+- **One crashed item abandoned the whole backlog.** A crash does not advance the attempt
+  counter, so the item reappeared forever — and the supervisor's repeat-detector
+  responded by breaking out of the entire loop. Items B and C never ran because item A
+  kept crashing. A stuck item is a fact about that item; it is skipped now, not fatal.
+
+- Objective truncation is logged instead of silently cutting mid-character. The sandbox
+  no longer disagrees with its own grader. `semantic_reviewer` is no longer invited to
+  reject on a save path it structurally cannot see.
+
+
+
+- **The benchmark was contaminated, and every sprint number this project has ever
+  recorded was taken through a dirty lens.**
+
+  `clear_ledger()` had exactly one caller in the codebase — `cli.py` — so a bench
+  run never cleared it. And `get_recent_rejections()` filters by **node name only**:
+  no task scoping, no run scoping. It returns the last three failures for that node
+  *from the whole file*.
+
+  So the `word_wrap` editor was handed `semver`'s traceback, under the heading
+  "PAST RUNTIME/ASSERTION FAILURES — your code ran but produced wrong results. Fix
+  the logic", and told to fix a bug in a file it was not writing. The ledger was
+  found **221 lines deep, spanning multiple tasks and multiple sessions.**
+
+  Three consequences, each of which invalidates the measurement:
+
+  - **The suite was order-dependent.** Task 4 carried tasks 1–3's failures into its
+    context; task 1 carried none. Reordering `TASKS` changed the score.
+  - **The repeats were not independent samples.** Run 2 began with run 1's failures
+    already in the editor's prompt — which voids the entire point of
+    `passed == passed every run`, the rule this benchmark otherwise defends more
+    carefully than anything else in it.
+  - **A run was not reproducible from a clean checkout.** The score depended on
+    ledger residue from whatever was run yesterday.
+
+  And `run_model` never touches the ledger, so the whole penalty fell on `sprint`
+  and never on `models` — a one-directional bias in precisely the comparison the
+  two suites exist to support. `bench/runner.clean_workspace()` now empties the
+  ledger and removes generated `*.py` and `__pycache__` before every task. The
+  hive's own records (`bench_history.jsonl` above all) are deliberately left alone.
+
+- **Only the graded artefact was cleaned between tasks.** Everything else survived,
+  and the reviewer sandbox runs with `PYTHONPATH=WORKSPACE_DIR` — so a module left
+  behind by an earlier task could shadow an import and let a task pass on
+  *yesterday's code*. The whole workspace is now cleaned.
+
+- **`--repeat` was silently ignored by the `models` suite.** Every models number
+  ever recorded is a single sample, and those samples were being read next to
+  sprint's strict pass-every-run aggregate — which is not a comparison, it is a
+  category error. `models` now honours `--repeat` and applies the same rule.
+  Expect the 30B to settle at **3/4, not the 4/4 that has been quoted**: at commit
+  `18e4dab` it already scored 3/4 with `semver` failing. The 4/4 was a coin landing
+  heads.
+
+- **The `[CONTRACT GAMED]` detector could cry wolf.** `_aggregate` stored
+  `contract_satisfied` with `any()` while `passed` used `all()`, so a row could
+  read `contract_satisfied=True, passed=False` assembled from two *different*
+  repeats — the exact gaming signature, manufactured out of ordinary flakiness with
+  no gaming anywhere. It aggregates with `all()` now. A detector that cries wolf
+  gets ignored, and then it is not a detector.
+
+- **The regression gate fired on task-count changes, not regressions.**
+  `quality_regression` was `quality_delta < 0` — a raw count difference. Add a task
+  to `TASKS` and every later run looks like an improvement; remove one and every
+  later run looks like a regression. It is now driven by `regressed_tasks`, matched
+  by name over the shared set, so it survives the suite growing or shrinking — and
+  when it fires it names the task that broke.
+
+
+- **The planner could hand the graph a file it was never allowed to write, and the
+  hive would spend its entire retry budget failing to.** Model-authored paths were
+  validated at the *write* boundary (`safe_path`) and nowhere else — so an illegal
+  path was only caught after a full generation had been paid for against it.
+
+  Worse than the wasted inference was where the error went. `reviewer_node` raised
+  `FILE SYSTEM ERROR: Path traversal blocked: 'test_add.py'`, that became an
+  `editor_error`, and the editor was handed it with *"FIX THE CODE SO IT PASSES."*
+  But the code was never wrong. The **path** was wrong, and the path lives in
+  `active_file`, which the editor cannot change. No output the model can produce
+  fixes it — so every retry regenerated the same file for the same illegal path,
+  failed identically, burned `MAX_RETRIES`, and escalated to a human for a problem
+  no human was needed for. Observed live on a two-line `add(a, b)`: four
+  generations and an escalation, for a task the 7B solves first try.
+
+  `core/utils.normalise_model_path()` is now the **entry** boundary, enforced in
+  `ticket_writer` across the whole queue (not just `tasks[0]` — every path in it
+  becomes `active_file` eventually, as `semantic_reviewer_node` retires tasks, so
+  validating only the first would have moved the bug deeper into the sprint where
+  it costs more).
+
+  It widens exactly one case: a **bare filename** has no directory component, so
+  the model's intent is not in question — it meant a workspace file and forgot to
+  say where — and `outputs/` is deterministic, not a guess. **Everything else
+  `safe_path` would refuse is still refused.** A traversal has a directory
+  component, so it is not a bare filename, so it falls straight through to
+  `safe_path` and is rejected: normalisation must never launder a path, and
+  `tests/test_safe_path.py` pins that. Unfixable tickets are dropped and logged; a
+  plan with no writable file at all now fails loudly instead of spinning.
+
+  Both outcomes log under `ticket_writer`, which none of the editor's three failure
+  feeds read. Handing the editor a routing complaint and telling it to "fix the
+  code structure" is the same category error the repeat-error breaker was already
+  taught once.
+
+  The ticket-writer prompt now names the failure explicitly too — but the prompt
+  already said "paths must start with 'src/' or 'outputs/'" and the model emitted
+  `test_add.py` anyway. A prompt is not a guarantee. That is why this is enforced
+  in code.
+
 
 Findings from a multi-agent adversarial audit of the codebase, most-severe first.
 
@@ -383,6 +378,7 @@ Findings from a multi-agent adversarial audit of the codebase, most-severe first
   against a lucky single run,** manufacturing a "quality regression" out of a
   fluke. `repeat` is now part of a run's identity, and `baseline_for()` only
   compares runs of the same repeat count.
+
 
 ## [4.6.0] - 2026-07-13
 
@@ -702,5 +698,9 @@ every entrypoint died on `ImportError` before a single node executed.
   equivalent needs a Job Object. Generated code is still bounded by the
   subprocess timeout and a stripped environment on both platforms.
 
-[Unreleased]: https://github.com/playa/multi_hive/compare/v4.2.0...HEAD
-[4.2.0]: https://github.com/playa/multi_hive/releases/tag/v4.2.0
+[Unreleased]: https://github.com/NewMe505/multi_hive/compare/v4.6.0...HEAD
+[4.6.0]: https://github.com/NewMe505/multi_hive/compare/v4.5.0...v4.6.0
+[4.5.0]: https://github.com/NewMe505/multi_hive/compare/v4.4.0...v4.5.0
+[4.4.0]: https://github.com/NewMe505/multi_hive/compare/v4.3.0...v4.4.0
+[4.3.0]: https://github.com/NewMe505/multi_hive/compare/v4.2.0...v4.3.0
+[4.2.0]: https://github.com/NewMe505/multi_hive/releases/tag/v4.2.0
