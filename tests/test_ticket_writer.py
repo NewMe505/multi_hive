@@ -115,6 +115,79 @@ def test_legal_plans_are_untouched(monkeypatch):
     assert memory.get_recent_rejections("ticket_writer") == ""
 
 
+# ── One ticket per file ───────────────────────────────────────────────────────
+
+
+def test_four_tickets_for_one_file_become_one(monkeypatch):
+    """
+    Measured live on lru_cache, against the real 7B:
+
+        ['outputs/lru.py', 'outputs/lru.py', 'outputs/lru.py', 'outputs/lru.py']
+
+    The planner's "MAXIMUM 4 STEPS" pressured a decomposition out of a single-file
+    objective, and the ticket writer turned it into four tickets — four FULL
+    rewrites of the same artefact, each one followed by another pass through
+    reviewer_node and semantic_reviewer_node.
+
+    The cost is not just 4x the inference. The semantic reviewer is a known source
+    of spurious FAILs, and running it four times on one file gives it four chances
+    to reject code that was already correct. Worse, on ticket 4 it is handed a
+    complete LRU cache and asked whether it implements "Handle eviction" — judging
+    a whole program against a quarter of a paraphrase.
+    """
+    out = _run(
+        [
+            {"file": "outputs/lru.py", "task": "Define LRUCache class with capacity"},
+            {"file": "outputs/lru.py", "task": "Implement get(key)"},
+            {"file": "outputs/lru.py", "task": "Implement put(key, value)"},
+            {"file": "outputs/lru.py", "task": "Handle eviction"},
+        ],
+        monkeypatch,
+    )
+
+    assert out["task_queue"] == []  # one ticket total, and it is the current one
+    assert out["active_file"] == "outputs/lru.py"
+
+    # Every requirement survives the merge. Losing one would be worse than the bug.
+    for requirement in ("capacity", "get(key)", "put(key, value)", "eviction"):
+        assert requirement in out["current_task"]
+
+
+def test_collapsing_happens_after_normalisation(monkeypatch):
+    """
+    Two tickets that both MEANT outputs/lru.py — one of them spelled `lru.py` —
+    are the same file, and must collapse. They only look the same after the path
+    has been normalised, so the order of the two passes is load-bearing.
+    """
+    out = _run(
+        [
+            {"file": "lru.py", "task": "Define the class"},
+            {"file": "outputs/lru.py", "task": "Implement eviction"},
+        ],
+        monkeypatch,
+    )
+
+    assert out["task_queue"] == []
+    assert out["active_file"] == "outputs/lru.py"
+    assert "Define the class" in out["current_task"]
+    assert "Implement eviction" in out["current_task"]
+
+
+def test_genuinely_different_files_are_not_merged(monkeypatch):
+    """The fix must not collapse a real multi-file plan into one ticket."""
+    out = _run(
+        [
+            {"file": "outputs/main.py", "task": "entrypoint"},
+            {"file": "src/util.py", "task": "helper"},
+        ],
+        monkeypatch,
+    )
+
+    assert out["active_file"] == "outputs/main.py"
+    assert len(out["task_queue"]) == 1
+    assert out["task_queue"][0]["file"] == "src/util.py"
+
+
 # ── The category error ────────────────────────────────────────────────────────
 
 

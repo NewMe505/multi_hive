@@ -93,6 +93,61 @@ def _legalise_paths(tasks: list[dict]) -> list[dict]:
     return legal
 
 
+def _collapse_by_file(tasks: list[dict]) -> list[dict]:
+    """
+    One ticket per file. Every ticket that targets the same file becomes one.
+
+    The planner is told "MAXIMUM 4 STEPS", which on a single-function objective
+    pressures it into a decomposition it did not need — and the ticket writer
+    dutifully turns that into four tickets. Measured live, on `lru_cache`:
+
+        ['outputs/lru.py', 'outputs/lru.py', 'outputs/lru.py', 'outputs/lru.py']
+
+    Four tickets. One file. And a file is not patched, it is REWRITTEN WHOLE by
+    the editor on every ticket — so this is four full regenerations of the same
+    artefact, each one followed by a full pass through reviewer_node and
+    semantic_reviewer_node.
+
+    That costs four times the inference, which is merely wasteful. What it does to
+    *quality* is worse, and it is why this is a correctness fix and not an
+    optimisation:
+
+    - **It multiplies every false-rejection source by four.** The semantic
+      reviewer is a known source of spurious FAILs — its entire NEVER REJECT block
+      is a scar list. Running it four times on one file gives it four chances to
+      reject code that was already correct, and any one of them burns a retry,
+      escalates the tier, and can wake a human.
+    - **It asks the reviewer an unanswerable question.** On ticket 4 the semantic
+      reviewer is handed a complete LRU cache and asked whether it implements
+      "Handle eviction". It is judging a whole program against one quarter of a
+      paraphrase, and it has no way to know that is what it is doing.
+
+    Merging preserves every requirement — the sub-tasks are joined, not dropped —
+    and hands the editor one shot with the full picture, which is exactly what the
+    `models` suite gives the raw model. First-appearance order is kept, so the
+    planner's sequencing survives.
+
+    Enforced here, in code, rather than in the planner's prompt. The prompt is
+    fixed too (see prompts.get_sprint_planner_prompt), but a prompt is not a
+    guarantee — a lesson this file learned once already, two functions up.
+    """
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+
+    for task in tasks:
+        target = task["file"]
+        if target not in merged:
+            merged[target] = {**task}
+            order.append(target)
+        else:
+            # Newline-joined, not comma-joined: these are separate requirements and
+            # the editor reads them as a list. Flattening them into prose is how a
+            # requirement gets skimmed past.
+            merged[target]["task"] += "\n" + task["task"]
+
+    return [merged[target] for target in order]
+
+
 def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
     # Explicit None checks, not falsiness: an empty-but-present queue means
     # "the queue was built and drained", which is not the same as "no queue".
@@ -135,7 +190,10 @@ def ticket_writer(state: dict[str, Any]) -> dict[str, Any]:
             "editor_retries": 1,
         }
 
-    tasks = _legalise_paths(tasks)
+    # Legalise first, collapse second. Collapsing keys on the file path, so two
+    # tickets that BOTH meant outputs/lru.py — one spelled "lru.py" — have to be
+    # normalised to the same string before they can be recognised as the same file.
+    tasks = _collapse_by_file(_legalise_paths(tasks))
 
     if not tasks:
         # Every ticket named a file the hive is not allowed to write. Fail here,

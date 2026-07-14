@@ -132,6 +132,58 @@ for line in wrap_text("the rain in spain falls mainly on the plain", 11):
     assert line == line.strip(), f"padded line {line!r}"
     assert len(line) <= 11, f"line over width: {line!r}"
 """,
+    # Prompt states subtractive notation, and that is the whole task. Every value
+    # here differs from the hidden suite's: the contract checks 19 / 48 / 2024, the
+    # suite checks 4 / 9 / 40 / 90 / 400 / 900 / 1994 / 3999. Same requirement,
+    # different numbers — so a model that memorises this table still fails the bench.
+    "roman": """\
+assert to_roman(19) == "XIX"
+assert to_roman(48) == "XLVIII"
+assert to_roman(2024) == "MMXXIV"
+
+assert from_roman("XIX") == 19
+assert from_roman("MMXXIV") == 2024
+
+# from_roman is the inverse of to_roman.
+assert from_roman(to_roman(777)) == 777
+""",
+    # Prompt states: matching type, correct order, every other character ignored.
+    # The interleaved case is what separates a stack from a counter, and a human
+    # reading "in the correct order" would think to write it.
+    "brackets": """\
+assert is_balanced("{}") is True
+assert is_balanced("{[()]}") is True
+assert is_balanced("x{y}z") is True
+
+assert is_balanced("]") is False
+assert is_balanced("(}") is False
+assert is_balanced("[(])") is False
+""",
+    # Prompt states: every run carries an explicit count, including runs of length
+    # 1, and decode is the exact inverse of encode. Both are checked. Nothing else.
+    "rle": """\
+assert encode("zzzy") == "z3y1"
+assert encode("q") == "q1"
+assert encode("m" * 10) == "m10"
+
+assert decode("z3y1") == "zzzy"
+
+# decode is the exact inverse of encode.
+assert decode(encode("pppqrrr")) == "pppqrrr"
+""",
+    # Prompt states: only dicts are recursed into, a list is left exactly as it is,
+    # and the separator is configurable. It does NOT say what an empty nested dict
+    # should do — so this contract stays silent about it, and the hidden suite still
+    # checks it. The silence is the design, not an omission.
+    "flatten": """\
+assert flatten({"x": {"y": 9}}) == {"x.y": 9}
+assert flatten({"p": {"q": {"r": 7}}}) == {"p.q.r": 7}
+
+# Only dicts are recursed into. A list is left exactly as it is.
+assert flatten({"k": [3, 4]}) == {"k": [3, 4]}
+
+assert flatten({"m": {"n": 5}}, sep="_") == {"m_n": 5}
+""",
 }
 
 

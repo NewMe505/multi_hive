@@ -181,6 +181,135 @@ for line in M.wrap_text("the quick brown fox jumps over the lazy dog", 9):
     assert len(line) <= 9, f"line over width: {line!r}"
 """,
     ),
+    # ── Added to give the suite enough resolution to measure a change ─────────
+    #
+    # Four tasks was not a benchmark, it was a rumour. One task is 25% of the
+    # score, and two of the four (semver, word_wrap) are coin flips — so the
+    # instrument could not resolve a one-task improvement, which is roughly what
+    # every worthwhile change to this system is worth. We were measuring with a
+    # ruler whose error bars were wider than the thing being measured.
+    #
+    # These four are deliberately *achievable* — a task no tier can pass tells you
+    # nothing on any run, and a task every tier passes tells you nothing either.
+    # Each one has a trap the prompt implies but does not spell out, which is the
+    # only kind of task worth adding (see the module docstring).
+    Task(
+        name="roman",
+        complexity="moderate",
+        filename="roman.py",
+        prompt=(
+            "Implement two functions for Roman numerals in the range 1..3999:\n"
+            "  to_roman(n: int) -> str\n"
+            "  from_roman(s: str) -> int\n"
+            "Use standard subtractive notation."
+        ),
+        # Trap: "standard subtractive notation" is the whole task and it is stated
+        # in four words. A model that builds a naive greedy table emits IIII for 4
+        # and LXXXX for 90 — clean, confident, and wrong. Round-tripping catches the
+        # from_roman half, which is usually the sloppier one.
+        tests="""
+assert M.to_roman(4) == "IV", M.to_roman(4)
+assert M.to_roman(9) == "IX", M.to_roman(9)
+assert M.to_roman(40) == "XL", M.to_roman(40)
+assert M.to_roman(90) == "XC", M.to_roman(90)
+assert M.to_roman(400) == "CD", M.to_roman(400)
+assert M.to_roman(900) == "CM", M.to_roman(900)
+assert M.to_roman(1994) == "MCMXCIV", M.to_roman(1994)
+assert M.to_roman(3999) == "MMMCMXCIX", M.to_roman(3999)
+
+assert M.from_roman("IV") == 4
+assert M.from_roman("MCMXCIV") == 1994
+
+for n in (1, 3, 8, 14, 44, 399, 1666, 3999):
+    assert M.from_roman(M.to_roman(n)) == n, f"round trip failed at {n}"
+""",
+    ),
+    Task(
+        name="brackets",
+        complexity="trivial",
+        filename="brackets.py",
+        prompt=(
+            "Implement is_balanced(s: str) -> bool which returns True when every "
+            "bracket in s is closed by the matching type in the correct order.\n"
+            "The brackets are (), [] and {}. Any other character is ignored."
+        ),
+        # Trap: a model that counts brackets instead of stacking them passes "()[]"
+        # and then says "([)]" is balanced. The interleaved case is the whole point,
+        # and a counter cannot see it. Empty string is vacuously True.
+        tests="""
+assert M.is_balanced("") is True
+assert M.is_balanced("()") is True
+assert M.is_balanced("([{}])") is True
+assert M.is_balanced("a(b)c[d]{e}") is True, "non-bracket characters not ignored"
+
+assert M.is_balanced("(") is False
+assert M.is_balanced(")(") is False, "order not checked"
+assert M.is_balanced("(]") is False, "closing bracket type not checked"
+assert M.is_balanced("([)]") is False, "interleaved brackets accepted — counting, not stacking"
+assert M.is_balanced("(((") is False
+""",
+    ),
+    Task(
+        name="rle",
+        complexity="moderate",
+        filename="rle.py",
+        prompt=(
+            "Implement run-length encoding:\n"
+            "  encode(s: str) -> str   e.g. 'aaabb' -> 'a3b2'\n"
+            "  decode(s: str) -> str   the exact inverse of encode\n"
+            "Every run carries an explicit count, including runs of length 1."
+        ),
+        # Traps: the run of length 1 (models love to emit "abc" instead of
+        # "a1b1c1", which silently breaks the inverse), and the multi-digit count —
+        # a decoder that reads one character per count turns "a12" into 1 'a' and a
+        # stray '2'. Both are invisible unless you round-trip.
+        tests="""
+assert M.encode("") == ""
+assert M.encode("aaabb") == "a3b2", M.encode("aaabb")
+assert M.encode("abc") == "a1b1c1", f"runs of length 1 need a count: {M.encode('abc')}"
+assert M.encode("a" * 12) == "a12", f"multi-digit count: {M.encode('a' * 12)}"
+
+assert M.decode("a3b2") == "aaabb"
+assert M.decode("a12") == "a" * 12, "decoder read one digit, not the whole count"
+
+for s in ("", "a", "abc", "wwwwaaadexxxxxx", "z" * 30 + "y"):
+    assert M.decode(M.encode(s)) == s, f"round trip failed on {s!r}"
+""",
+    ),
+    Task(
+        name="flatten",
+        complexity="moderate",
+        filename="flatten.py",
+        prompt=(
+            "Implement flatten(d: dict, sep: str = '.') -> dict which flattens a "
+            "nested dictionary into a single level, joining the nested keys with "
+            "`sep`.\n"
+            "Only dictionaries are recursed into. Any other value — including a "
+            "list — is left exactly as it is."
+        ),
+        # Trap: "only dictionaries are recursed into" is stated, and models still
+        # walk into lists, or worse, flatten a dict that happens to sit inside one.
+        # The empty nested dict is the second trap: it contributes no leaf, so it
+        # should contribute no key, and a naive recursion silently drops it or
+        # emits a key with no value.
+        tests="""
+assert M.flatten({}) == {}
+assert M.flatten({"a": 1}) == {"a": 1}
+assert M.flatten({"a": {"b": 1}}) == {"a.b": 1}
+
+got = M.flatten({"a": {"b": {"c": 1}}, "d": 2})
+assert got == {"a.b.c": 1, "d": 2}, got
+
+got = M.flatten({"a": [1, {"b": 2}]})
+assert got == {"a": [1, {"b": 2}]}, f"recursed into a list: {got}"
+
+got = M.flatten({"a": {"b": 1}}, sep="/")
+assert got == {"a/b": 1}, f"sep ignored: {got}"
+
+got = M.flatten({"a": {}, "b": 1})
+assert got == {"b": 1}, f"empty nested dict produced a key: {got}"
+""",
+    ),
 ]
 
 BY_NAME = {task.name: task for task in TASKS}

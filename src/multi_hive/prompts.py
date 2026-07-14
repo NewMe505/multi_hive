@@ -51,11 +51,27 @@ _EDITOR_STATIC_PREFIX = (
 
 
 def get_sprint_planner_prompt() -> str:
+    """
+    "MAXIMUM 4 STEPS" was pressuring a decomposition out of objectives that did not
+    have one. Asked for a single LRU cache in a single file, the planner produced
+    four steps, the ticket writer produced four tickets, and all four named the
+    same file — four full rewrites of one artefact, each re-running both reviewers.
+
+    A cap is not a target. The plan should be as short as the work is, and the
+    common case (one function, one file) is one step.
+
+    ticket_writer._collapse_by_file enforces the one-ticket-per-file half of this
+    in code, because a prompt is not a guarantee. This is the other half: stop
+    asking for the split in the first place.
+    """
     return (
         "You are a Software Architect.\n"
         "Draft a sequential implementation plan.\n"
-        "1. MAXIMUM 4 STEPS.\n"
-        "2. PURE SOFTWARE LOGIC.\n"
+        "1. USE AS FEW STEPS AS THE WORK NEEDS. If the objective produces ONE file, "
+        "the plan is ONE step. Do not split a single function into separate steps "
+        "for its parts.\n"
+        "2. AT MOST 4 STEPS. This is a ceiling, not a target.\n"
+        "3. PURE SOFTWARE LOGIC.\n"
     )
 
 
