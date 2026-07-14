@@ -108,3 +108,62 @@ def test_empty_and_missing_paths_are_refused():
     assert normalise_model_path("") is None
     assert normalise_model_path("   ") is None
     assert normalise_model_path(None) is None
+
+
+# ── Canonicalisation — the key everything else is keyed on ───────────────────
+
+
+def test_every_spelling_of_a_file_collapses_to_one_key():
+    """
+    normalise_model_path used to return the string the MODEL typed. Its docstring
+    claimed the result was canonical. It was not, and that string is the key for
+    everything downstream:
+
+    - _collapse_by_file keys on it, so two tickets for one file were not merged;
+    - project_files keys on it, so a second ticket read back "" and rewrote a
+      passing file from scratch;
+    - contract_for() matches on it, so an ACCEPTANCE contract keyed under
+      `outputs/lru.py` was NOT FOUND for `./outputs/lru.py` — reviewer_node took the
+      no-contract branch, ran the file, got exit 0, and passed. The sprint was
+      journalled CLEAN and the human's asserts never ran.
+    """
+    for spelling in (
+        "outputs/lru.py",
+        "./outputs/lru.py",
+        "outputs//lru.py",
+        "lru.py",
+        r"outputs\lru.py",
+    ):
+        assert normalise_model_path(spelling) == "outputs/lru.py", spelling
+
+
+def test_a_windows_device_name_is_refused():
+    """
+    Win32 resolves a DOS device INSIDE a real directory: workspace/outputs/NUL
+    stats fine, reads empty, and swallows every write.
+
+    So the hive would "write" a file that is discarded, py_compile would see empty
+    source and pass, the sandbox would run an empty program and exit 0 — and the
+    sprint would be journalled CLEAN having produced nothing at all.
+    """
+    assert normalise_model_path("NUL") is None
+    assert normalise_model_path("outputs/NUL") is None
+    assert normalise_model_path("outputs/CON.py") is None
+    assert normalise_model_path("outputs/COM1") is None
+
+
+def test_a_trailing_dot_component_is_refused():
+    """
+    Win32 strips a trailing dot, so `outputs/...` resolves to the outputs DIRECTORY.
+    safe_path approves it (it really is inside the workspace), flush_file tries to
+    write over a directory, and the PermissionError reaches the editor as a code
+    failure it structurally cannot fix — the unwinnable retry loop this function
+    exists to prevent.
+    """
+    assert normalise_model_path("outputs/...") is None
+    assert normalise_model_path("outputs/wrap.py.") is None
+
+
+def test_an_alternate_data_stream_is_refused():
+    """`outputs/wrap.py:evil` writes a hidden NTFS stream and leaves wrap.py empty."""
+    assert normalise_model_path("outputs/wrap.py:evil") is None

@@ -157,3 +157,53 @@ def test_unstructured_gate_lines_are_not_mistaken_for_escalations():
     memory.clear_ledger()
     memory.log_rejection("human_gate_node", "GATE TIMEOUT: no acknowledgement after 120s.")
     assert memory.get_escalations() == []
+
+
+# ── A torn write must not brick the loop ─────────────────────────────────────
+
+
+def test_invalid_utf8_does_not_crash_the_reader():
+    """
+    The try/except in read_sprints guards json.loads — but decoding happens in
+    `for line in f`, OUTSIDE it. Invalid UTF-8 raised UnicodeDecodeError from the
+    iterator and nothing caught it.
+
+    JOURNAL_FILE is never cleared, and discover() / digest() / --digest all read it,
+    so one torn byte bricked the whole autonomous loop until a human hand-edited the
+    file.
+    """
+    journal.record_sprint("first", journal.CLEAN)
+    with JOURNAL_FILE.open("ab") as f:
+        f.write(b'{"type": "sprint", "objective": "\xff\xfe torn"}\n')
+    journal.record_sprint("second", journal.CLEAN)
+
+    objectives = [s["objective"] for s in journal.read_sprints()]
+    assert "first" in objectives and "second" in objectives
+
+
+# ── A crash must not permanently retire real work ────────────────────────────
+
+
+def test_a_crash_does_not_count_as_an_attempt():
+    """
+    attempts_for used to count records "to any outcome". discovery parks an item at
+    2 attempts. So:
+
+        human runs it       -> ESCALATED (attempt 1)
+        --loop retries it, Ollama is down -> FAILED (attempt 2)
+        -> parked forever, having spent zero tokens
+
+    The strong model — the entire point of the tier_floor replay — never ran, and
+    parked() would tell a human "the ladder is out of rungs" when it was never
+    climbed. One HIVE_MAX_USD misconfiguration could retire a whole backlog.
+    """
+    key = journal.key_for("wrap it")
+
+    journal.record_sprint("wrap it", journal.ESCALATED)  # a real attempt
+    assert journal.attempts_for(key) == 1
+
+    journal.record_sprint("wrap it", journal.FAILED)  # a crash / spent budget
+    assert journal.attempts_for(key) == 1, "a crash was counted as an attempt"
+
+    journal.record_sprint("wrap it", journal.ESCALATED)  # a second real attempt
+    assert journal.attempts_for(key) == 2

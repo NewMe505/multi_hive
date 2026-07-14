@@ -17,27 +17,36 @@ An autonomous loop that cannot prove it stops is not a feature, it is an inciden
 Three independent things bound this one, and they are independent on purpose:
 
 1. **The governor.** Checked before every sprint and before every model call
-   inside it. `HIVE_MAX_USD` / `HIVE_MAX_TOKENS` / `HIVE_MAX_WALL_SEC` /
-   `HIVE_MAX_SPRINTS`.
+   inside it. But every ceiling — `HIVE_MAX_USD`, `HIVE_MAX_TOKENS`,
+   `HIVE_MAX_WALL_SEC`, `HIVE_MAX_SPRINTS` — **defaults to OFF**, so out of the box
+   this bound does not exist. `_ceilings()` prints "NONE SET — nothing will stop
+   this" for precisely that reason. Set one before pointing this at a paid provider.
 2. **The attempt cap.** `discovery` stops handing back a work item after
-   `MAX_DISCOVERY_ATTEMPTS`, so the backlog is strictly finite. Each sprint either
-   resolves an item or burns one of its attempts.
-3. **The progress check.** If a full discovery round completes zero sprints, the
-   loop stops rather than spinning. This is the backstop for the case the other
-   two do not cover — see below, it is the one that actually bites.
+   `MAX_DISCOVERY_ATTEMPTS` *merit* attempts, so the backlog is strictly finite.
+3. **The `attempted` set.** The one that actually holds the line.
 
-## The bug this module was written around
+## The bug this module was written around, and the bug in the first fix for it
 
-A crashing sprint writes no journal record. No journal record means
-`attempts_for()` does not advance. Which means `discover()` returns the *same
-work item* on the next pass, forever, at whatever rate the crash happens — a
-tight, free, infinite loop that never spends a token and therefore never trips the
-governor.
+A crashing sprint hands the *same work item* back on the next pass, forever, at
+whatever rate the crash happens — a tight, free, infinite loop that never spends a
+token and therefore never trips the governor.
 
-So a crash is journalled as FAILED **by the supervisor**, explicitly, precisely so
-the attempt counter advances. The loop's termination proof rests on every sprint
-producing exactly one journal record, whatever happens to it, and that guarantee
-lives here rather than in the happy path where it would be easy to lose.
+The obvious guard was to journal the crash so `attempts_for()` advances and the
+item is eventually parked. That was the first fix, and **it was wrong.** Counting a
+crash as an attempt means one Ollama outage burns one of an item's two chances
+having spent zero tokens — and a single `HIVE_MAX_USD` misconfiguration during an
+overnight run could permanently retire the entire backlog, with `parked()` then
+telling a human "the ladder is out of rungs" when the ladder was never climbed.
+
+So `journal.attempts_for` counts only sprints that ran on their merits, and the
+counter deliberately does NOT advance on a crash. Which rests the whole termination
+proof on `attempted` — the process-local set of every (item, attempt) this run has
+executed. If discovery offers work this run has already done, the journal is not
+advancing and the loop stops, whatever the disk thinks.
+
+`_work` still journals the crash, but for the digest and the audit trail, not for
+termination. **Do not "simplify" the `attempted` set away.** It is the guard, and
+`tests/test_supervisor.py` hangs without it.
 
 ## Headless
 
