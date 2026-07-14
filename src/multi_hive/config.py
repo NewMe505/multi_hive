@@ -160,12 +160,22 @@ RECURSION_LIMIT = int(os.environ.get("HIVE_RECURSION_LIMIT", "120"))
 GATE_TIMEOUT_SEC = int(os.environ.get("HIVE_GATE_TIMEOUT", "120"))
 
 # How long generated code may run in the reviewer sandbox before it is killed.
-# Aligned with the grader's own 60s (bench/suite.grade). They were 10 and 60, and
-# that gap is a false rejection waiting to happen: correct code whose demo block is
-# merely slow died in the hive and passed in the bench, which is the worst possible
-# direction for a disagreement — the system rejects work its own scorer would accept.
-# If a program needs more than a minute, that is a real finding either way.
-SANDBOX_TIMEOUT_SEC = int(os.environ.get("HIVE_SANDBOX_TIMEOUT", "60"))
+# The gap with the grader (60s) was a false rejection waiting to happen: correct code
+# whose demo block is merely slow died in the hive and passed in the bench — the
+# system rejecting work its own scorer would accept, which is the worst possible
+# direction for a disagreement.
+#
+# But 60 was the wrong correction, and the symmetry argument was wrong with it.
+# suite.grade() runs its 60s ONCE, on the final artefact. This sandbox runs on EVERY
+# editor attempt. At 60s a model that emits an infinite loop costs
+# 60 x (MAX_RETRIES + 1) = 240s per task instead of 40 — and across a 9-task suite at
+# --repeat 3 that is hours of pure timeout, with nothing to stop it.
+#
+# 30s is the honest middle: comfortably past any legitimate demo block (the slowest
+# real task in the suite runs in well under a second), and still bounded when the
+# model writes `while True`. Raise it if you have a task that genuinely needs longer;
+# do not raise it to match a number that is only paid once.
+SANDBOX_TIMEOUT_SEC = int(os.environ.get("HIVE_SANDBOX_TIMEOUT", "30"))
 
 # Cap on raw user input before it reaches any LLM context window.
 MAX_INPUT_CHARS = int(os.environ.get("HIVE_MAX_INPUT_CHARS", "4000"))

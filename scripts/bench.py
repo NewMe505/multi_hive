@@ -175,7 +175,13 @@ def bench_models(models: list[str], repeat: int = 1) -> list[history.Run]:
                     "input_tokens": statistics.median([r.get("input_tokens", 0) for r in reps]),
                     "total_tokens": statistics.median([r.get("total_tokens", 0) for r in reps]),
                     "attempts": 1,
-                    "first_attempt_passed": passes == len(reps),
+                    # A one-shot model has exactly one attempt, so "did the first
+                    # attempt pass" IS "did it pass". Assigning `passes == len(reps)`
+                    # made the field carry no information here while _story() printed
+                    # it in the same 1st-try column as the hive's genuine first-attempt
+                    # rate — inviting a comparison between a real number and a
+                    # tautology. It is None: the question does not apply.
+                    "first_attempt_passed": None,
                     "usd": 0.0,
                     "gpu_placement": reps[0].get("gpu_placement", "?"),
                 }
@@ -339,6 +345,9 @@ def _aggregate(results: dict[str, list[dict]], contract: bool, repeat: int) -> h
                 "discarded_a_pass": any(r.get("discarded_a_pass") for r in runs),
                 "total_tokens": statistics.median([r.get("total_tokens", 0) for r in runs]),
                 "usd": round(statistics.median([r.get("usd", 0.0) for r in runs]), 6),
+                # SUM, not median: one unreadable call anywhere invalidates the cost
+                # figure, and a median would hide it behind two clean runs.
+                "unmetered": sum(r.get("unmetered", 0) or 0 for r in runs),
                 # all(), not any() — it must aggregate the same way `passed` does.
                 #
                 # With any(), a row could read contract_satisfied=True, passed=False
@@ -427,16 +436,35 @@ def _story(run: history.Run) -> None:
 
     tokens = sum(t.get("total_tokens", 0) or 0 for t in tasks)
     usd = sum(t.get("usd", 0.0) or 0.0 for t in tasks)
-    first = sum(1 for t in tasks if t.get("first_attempt_passed"))
+    first = sum(1 for t in tasks if t.get("first_attempt_passed") is True)
     thrash = statistics.median([t.get("attempts", 0) or 0 for t in tasks])
     discarded = [t["task"] for t in tasks if t.get("discarded_a_pass")]
     passed = run.passed or 1  # a 0-pass run's tokens-per-pass is meaningless anyway
 
     cost = f"${usd:.4f}" if usd else "free"
+
+    # `first_attempt_passed` is None for the one-shot suite — the question does not
+    # apply to a model that only gets one attempt. Print a dash rather than a number
+    # that invites a false comparison.
+    applicable = [t for t in tasks if t.get("first_attempt_passed") is not None]
+    first_col = f"{first}/{len(applicable)}" if applicable else "n/a"
+
     print(
         f"  {DIM}tokens {tokens:,} ({tokens // passed:,}/pass, {cost})   "
-        f"1st-try {first}/{len(tasks)}   thrash {thrash:.1f} attempts{RESET}"
+        f"1st-try {first_col}   thrash {thrash:.1f} attempts{RESET}"
     )
+
+    # A cost figure computed from a BROKEN meter is worse than no cost figure: it is
+    # plausible, low, and wrong. record_unmetered() counts the calls the governor
+    # could not read, and if HIVE_MAX_USD/HIVE_MAX_TOKENS are unset (the ollama
+    # default) the HIVE_MAX_UNMETERED ceiling never fires — so the understated number
+    # above is all the operator would ever see. Say so.
+    unmetered = sum(t.get("unmetered", 0) or 0 for t in tasks)
+    if unmetered:
+        print(
+            f"  {RED}{BOLD}{unmetered} model call(s) reported NO token usage{RESET} "
+            f"{DIM}— the cost above is an undercount, not a measurement.{RESET}"
+        )
 
     if discarded:
         print(

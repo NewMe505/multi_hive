@@ -167,7 +167,12 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     if len(raw_objective) > _MAX_OBJECTIVE_CHARS:
         global_objective = raw_objective[:_MAX_OBJECTIVE_CHARS] + "..."
         log_rejection(
-            "ticket_writer",  # not an editor feed — see _legalise_paths for why
+            # Its own name. It must stay out of the editor's three failure feeds
+            # (get_recent_rejections reads async_editor_node / reviewer_node /
+            # semantic_reviewer_node), but filing it under "ticket_writer" made the
+            # ledger lie: an operator grepping for why the TICKET WRITER misbehaved
+            # would find an editor-context event.
+            "editor_context",
             f"OBJECTIVE TRUNCATED: {len(raw_objective)} chars cut to "
             f"{_MAX_OBJECTIVE_CHARS} for the editor's context window. The dropped "
             f"tail is: {raw_objective[_MAX_OBJECTIVE_CHARS:][:200]!r}",
@@ -183,13 +188,15 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     # against the literals is real, and it is answered with a prompt rule and a
     # benchmark that can actually detect it — not by withholding the spec. See
     # contract.py and bench/contracts.py.
+    contract = contract_for(state.get("contracts") or {}, active_file)
+
     sys_prompt = prompts.get_editor_prompt(
         global_objective,
         state.get("specialist_context", ""),
         get_recent_rejections("async_editor_node"),
         get_recent_rejections("reviewer_node"),
         get_recent_rejections("semantic_reviewer_node"),
-        acceptance_contract=contract_for(state.get("contracts") or {}, active_file),
+        acceptance_contract=contract,
     )
 
     # Full text for the active file; signature outlines for everything else.
@@ -243,11 +250,32 @@ async def async_editor_node(state: dict[str, Any]) -> dict[str, Any]:
     # So the requirement goes last, verbatim, and it is named as the authority. The
     # ticket stays — it says which FILE and which part of the work — but where the
     # two disagree, the human wins.
-    user_prompt += (
-        f"{newline}{newline}THE FULL REQUIREMENT, EXACTLY AS THE HUMAN WROTE IT.{newline}"
-        f"The task above says which part of the work to do. THIS says what correct "
-        f"means. Where they disagree, this wins:{newline}{global_objective}"
-    )
+    # In CONTRACT mode the requirement is CONTEXT, not the judge — and saying
+    # otherwise was a live contradiction.
+    #
+    # _EDITOR_CONTRACT_PREFIX rule 2 tells the model "An ACCEPTANCE CONTRACT is
+    # supplied below... It is the ONLY thing your code will be judged on." Appending
+    # "the requirement wins where they disagree" told it something else was the
+    # authority — and contracts are DELIBERATELY a strict subset of the objective
+    # (bench/contracts.py rule 1: the word_stats contract omits the empty-input and
+    # n>vocab cases on purpose). So the model was being handed two authorities that
+    # genuinely differ, in the one mode that scores 9/9.
+    #
+    # The requirement still goes last, because the ticket is still a paraphrase and
+    # the model still needs to see what was actually asked. It is just no longer
+    # claiming to outrank the contract.
+    if contract:
+        user_prompt += (
+            f"{newline}{newline}THE FULL REQUIREMENT, AS THE HUMAN WROTE IT — for "
+            f"CONTEXT. The ACCEPTANCE CONTRACT above is what your code is judged on; "
+            f"this is what it is FOR:{newline}{global_objective}"
+        )
+    else:
+        user_prompt += (
+            f"{newline}{newline}THE FULL REQUIREMENT, EXACTLY AS THE HUMAN WROTE IT.{newline}"
+            f"The task above says which part of the work to do. THIS says what correct "
+            f"means. Where they disagree, this wins:{newline}{global_objective}"
+        )
 
     # ── Generation ────────────────────────────────────────────────────────────
     try:

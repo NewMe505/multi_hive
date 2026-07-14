@@ -168,3 +168,57 @@ def test_the_strong_model_gets_a_blank_page_on_escalation():
     assert "THE_WEAK_MODELS_BROKEN_CODE" not in user, "the strong model inherited the bad draft"
     assert "A WEAKER MODEL ATTEMPTED THIS AND FAILED" in user  # the failure, as a warning
     assert "FIX THE CODE SO IT PASSES" not in user             # ...not as a leash
+
+
+def test_contract_mode_is_not_given_two_authorities():
+    """
+    A live contradiction, caught in review, in the ONE mode that scores 9/9.
+
+    _EDITOR_CONTRACT_PREFIX rule 2 tells the model "An ACCEPTANCE CONTRACT is supplied
+    below... It is the ONLY thing your code will be judged on." Appending "the
+    requirement wins where they disagree" told it something ELSE was the authority —
+    and contracts are DELIBERATELY a strict subset of the objective (bench/contracts.py
+    rule 1). So the two genuinely differ, and the model was told both were final.
+
+    The requirement still goes last, because the ticket is still a paraphrase. It just
+    no longer claims to outrank the contract.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from langchain_core.messages import HumanMessage
+
+    from multi_hive.nodes.execution import async_editor_node as mod
+
+    captured: dict = {}
+
+    class _FakeLLM:
+        async def ainvoke(self, messages):
+            captured["user"] = messages[-1].content
+            return type("R", (), {"content": "```python\nx = 1\n```"})()
+
+    def run(contracts):
+        with patch.object(mod, "get_async_llm", lambda *a, **k: _FakeLLM()):
+            asyncio.run(
+                mod.async_editor_node(
+                    {
+                        "current_task": "implement it",
+                        "active_file": "outputs/x.py",
+                        "messages": [HumanMessage(content="THE REQUIREMENT")],
+                        "project_files": {},
+                        "contracts": contracts,
+                    }
+                )
+            )
+        return captured["user"]
+
+    # No contract: the requirement IS the authority.
+    plain = run({})
+    assert "THE REQUIREMENT" in plain
+    assert "this wins" in plain
+
+    # With a contract: the requirement is CONTEXT. The contract is the judge.
+    with_contract = run({"outputs/x.py": "assert x == 1\n"})
+    assert "THE REQUIREMENT" in with_contract, "the spec must still be visible"
+    assert "this wins" not in with_contract, "it must not outrank the contract"
+    assert "judged on" in with_contract
